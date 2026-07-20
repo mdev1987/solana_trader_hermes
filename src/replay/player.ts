@@ -72,7 +72,16 @@ export class Player {
         console.log(`${prefix}Using cached ${cachePath}`);
       }
 
-      const events = this.parser.parse(data);
+      process.stdout.write(`${prefix}Decompressing...`);
+      const events = this.parser.parse(data, (parsed, total) => {
+        process.stdout.clearLine?.(0);
+        process.stdout.cursorTo?.(0);
+        const pct = total > 0 ? Math.round((parsed / total) * 100) : 0;
+        const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
+        process.stdout.write(`${prefix}Parsing ${bar} ${pct}%`);
+      });
+      process.stdout.write('\n');
+
       events.sort((a, b) => a.timestamp - b.timestamp);
 
       for (const event of events) {
@@ -93,9 +102,20 @@ export class Player {
   }
 
   async replayFile(filePath: string): Promise<number> {
-    console.log(`[file] ${filePath}`);
+    const prefix = '[file] ';
+    console.log(`${prefix}${filePath}`);
     const data = readFileSync(filePath);
-    const events = this.parser.parse(data);
+
+    process.stdout.write(`${prefix}Decompressing...`);
+    const events = this.parser.parse(data, (parsed, total) => {
+      process.stdout.clearLine?.(0);
+      process.stdout.cursorTo?.(0);
+      const pct = total > 0 ? Math.round((parsed / total) * 100) : 0;
+      const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
+      process.stdout.write(`${prefix}Parsing ${bar} ${pct}%`);
+    });
+    process.stdout.write('\n');
+
     events.sort((a, b) => a.timestamp - b.timestamp);
 
     let count = 0;
