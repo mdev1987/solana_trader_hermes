@@ -1,0 +1,37 @@
+import type { Decision, StrategyConfig, ScoredToken } from '../types/strategy.ts';
+import type { FeatureSnapshot } from '../types/feature.ts';
+import { Filters } from './filters.ts';
+import { Scorer } from './scorer.ts';
+import { DecisionMaker } from './decision.ts';
+
+export class Strategy {
+  private filters: Filters;
+  private scorer: Scorer;
+  private decisionMaker: DecisionMaker;
+
+  constructor(config: StrategyConfig) {
+    this.filters = new Filters(config);
+    this.scorer = new Scorer();
+    this.decisionMaker = new DecisionMaker(config);
+  }
+
+  evaluate(snapshot: FeatureSnapshot): { decision: Decision; score: number; reason: string } {
+    if (!this.filters.passes(snapshot)) {
+      return { decision: 'SKIP', score: 0, reason: 'filtered' };
+    }
+
+    const score = this.scorer.score(snapshot);
+    const decision = this.decisionMaker.decide(score, snapshot);
+    return { decision, score, reason: decision === 'BUY' ? `score=${score.toFixed(1)}` : 'below threshold' };
+  }
+
+  evaluateBatch(snapshots: FeatureSnapshot[]): ScoredToken[] {
+    return snapshots
+      .map((s) => {
+        const { score } = this.evaluate(s);
+        return { mint: s.mint, score, reason: '' };
+      })
+      .filter((s) => s.score > 0)
+      .sort((a, b) => b.score - a.score);
+  }
+}

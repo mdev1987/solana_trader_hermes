@@ -1,0 +1,27 @@
+{
+  "name": "solana_trader_hermes",
+  "module": "src/main.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "replay": "bun run src/main.ts replay",
+    "rank": "bun run src/main.ts rank",
+    "heatmap": "bun run src/main.ts heatmap",
+    "optimize": "bun run src/main.ts optimize",
+    "report": "bun run src/main.ts report",
+    "bot": "bun run src/main.ts bot",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@dotenvx/dotenvx": "^2.14.0",
+    "@oneidentity/zstd-js": "^1.0.3",
+    "grammy": "^1.45.1",
+    "telegram-markdown-v2": "^0.0.5"
+  }
+}
