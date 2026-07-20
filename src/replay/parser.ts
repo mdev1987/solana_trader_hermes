@@ -1,8 +1,10 @@
 import { spawnSync } from 'bun';
 import type { ReplayEvent } from '../types/replay.ts';
 
+const NEWLINE = 0x0A;
+
 export class Parser {
-  decompress(compressed: Uint8Array): string {
+  decompress(compressed: Uint8Array): Buffer {
     const proc = spawnSync(['zstd', '-d'], {
       stdin: compressed,
       stdout: 'pipe',
@@ -14,26 +16,36 @@ export class Parser {
       throw new Error(`zstd decompression failed (exit ${proc.exitCode}): ${stderr}`);
     }
 
-    return Buffer.from(proc.stdout).toString();
+    return proc.stdout as Buffer;
   }
 
-  parseLines(text: string): ReplayEvent[] {
+  parseLines(buf: Buffer): ReplayEvent[] {
     const events: ReplayEvent[] = [];
-    for (const line of text.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const event = JSON.parse(trimmed) as ReplayEvent;
-        events.push(event);
-      } catch {
-        console.warn('[parser] skipping invalid JSON line');
+    let start = 0;
+
+    while (start < buf.length) {
+      const end = buf.indexOf(NEWLINE, start);
+      if (end === -1) break;
+
+      if (end > start) {
+        const line = buf.toString('utf-8', start, end).trim();
+        if (line) {
+          try {
+            events.push(JSON.parse(line) as ReplayEvent);
+          } catch {
+            console.warn('[parser] skipping invalid JSON line');
+          }
+        }
       }
+
+      start = end + 1;
     }
+
     return events;
   }
 
   parse(compressed: Uint8Array): ReplayEvent[] {
-    const text = this.decompress(compressed);
-    return this.parseLines(text);
+    const buf = this.decompress(compressed);
+    return this.parseLines(buf);
   }
 }
