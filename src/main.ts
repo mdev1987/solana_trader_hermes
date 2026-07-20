@@ -7,7 +7,7 @@ import { PaperExecutor } from './execution/paper.ts';
 import { ExecutionRouter } from './execution/router.ts';
 import { TradeRepository } from './storage/trade_repository.ts';
 import { FeatureRepository } from './storage/feature_repository.ts';
-import { ReplayRepository } from './storage/replay_repository.ts';
+
 import { calculateMetrics } from './analytics/metrics.ts';
 import { printReport } from './analytics/report.ts';
 import { Optimizer } from './analytics/optimizer.ts';
@@ -55,17 +55,19 @@ export async function main() {
 }
 
 async function runReplay(args: string[]): Promise<void> {
-  const hoursCount = Number(args[1] ?? 2);
+  const noCache = args.includes('--no-cache');
+  const numericArgs = args.filter((a) => !a.startsWith('--'));
+  const hoursCount = Number(numericArgs[1] ?? 2);
   const config = createConfig();
   const featureBuilder = new FeatureBuilder();
   const featureStore = new FeatureStore();
   const player = new Player();
+  player.noCache = noCache;
   const strategy = new Strategy(config);
   const executor = new PaperExecutor(config, ENV.PAPER_BALANCE, ENV.PAPER_SOL_AMOUNT);
   const router = new ExecutionRouter(executor);
   const tradeRepo = new TradeRepository();
   const featureRepo = new FeatureRepository();
-  const replayRepo = new ReplayRepository();
   const snapshotCache = new Map<string, FeatureSnapshot>();
 
   player.onEvent((event: ReplayEvent) => {

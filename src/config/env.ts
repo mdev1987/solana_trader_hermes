@@ -10,4 +10,5 @@ export const ENV = {
   PAPER_SOL_AMOUNT: Number(process.env.PAPER_SOL_AMOUNT ?? 0.1),
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ?? '',
   TELEGRAM_CHAT_ID: Number(process.env.TELEGRAM_CHAT_ID) || 0,
+  DATA_DIR: process.env.DATA_DIR ?? './data',
 };

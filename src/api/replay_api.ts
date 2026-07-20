@@ -1,12 +1,23 @@
 import { ENV } from '../config/env.ts';
 import type { ReplayHour } from '../types/replay.ts';
 
+export function padHour(hour: ReplayHour): { y: string; m: string; d: string; h: string } {
+  return {
+    y: String(hour.year),
+    m: String(hour.month).padStart(2, '0'),
+    d: String(hour.day).padStart(2, '0'),
+    h: String(hour.hour).padStart(2, '0'),
+  };
+}
+
 export function buildReplayUrl(hour: ReplayHour): string {
-  const y = String(hour.year);
-  const m = String(hour.month).padStart(2, '0');
-  const d = String(hour.day).padStart(2, '0');
-  const h = String(hour.hour).padStart(2, '0');
+  const { y, m, d, h } = padHour(hour);
   return `${ENV.REPLAY_BASE_URL}/${y}/${m}/${d}/${h}.jsonl.zst`;
+}
+
+export function buildReplayCachePath(hour: ReplayHour): string {
+  const { y, m, d, h } = padHour(hour);
+  return `${ENV.DATA_DIR}/replay/${y}/${m}/${d}/${h}.jsonl.zst`;
 }
 
 export interface DownloadProgress {
