@@ -71,17 +71,24 @@ async function runReplay(args: string[]): Promise<void> {
   const snapshotCache = new Map<string, FeatureSnapshot>();
 
   player.onEvent((event: ReplayEvent) => {
+    if (!event.mint || !event.mint.endsWith('pump')) return;
+    if (event.action !== 'buy' && event.action !== 'sell' && event.action !== 'create') return;
+
+    const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
+    const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
+
     const snapshot = featureBuilder.fromReplayEvent(event);
+    if (!snapshot) return;
     featureStore.set(snapshot);
     snapshotCache.set(event.mint, snapshot);
 
     const { decision, score } = strategy.evaluate(snapshot);
     if (decision === 'BUY') {
       const pos = router.execute(decision, snapshot);
-      if (pos) console.log(`[BUY] ${event.mint} score=${score.toFixed(1)} price=${event.price}`);
+      if (pos) console.log(`[BUY] ${event.mint} score=${score.toFixed(1)} price=${price.toExponential(3)}`);
     }
 
-    const priceMap = new Map([[event.mint, event.price]]);
+    const priceMap = new Map([[event.mint, price]]);
     const exited = router.updatePositions(priceMap, event.timestamp);
     for (const trade of exited) {
       console.log(`[SELL] ${trade.mint} pnl=${trade.pnl.toFixed(4)} (${(trade.pnlPercent * 100).toFixed(2)}%) reason=${trade.exitReason}`);

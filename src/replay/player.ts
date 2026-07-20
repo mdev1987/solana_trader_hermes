@@ -69,13 +69,16 @@ export class Player {
 
       const { data } = result;
 
+      const totalLines = await this.parser.countLines(data);
+
       const hourCount = await this.parser.parseStream(data, async (event) => {
         this.clock.setTime(event.timestamp);
         await this.emit(event);
-      }, (parsed) => {
+      }, totalLines, (parsed, total) => {
         process.stdout.clearLine?.(0);
         process.stdout.cursorTo?.(0);
-        process.stdout.write(`${prefix}${(parsed / 1000).toFixed(0)}K events`);
+        const pct = total > 0 ? ((parsed / total) * 100).toFixed(1) : '0.0';
+        process.stdout.write(`${prefix}${parsed}/${total} (${pct}%)`);
       });
       process.stdout.write('\n');
 
@@ -96,13 +99,16 @@ export class Player {
     console.log(`${prefix}${filePath}`);
     const data = readFileSync(filePath);
 
+    const totalLines = await this.parser.countLines(data);
+
     const count = await this.parser.parseStream(data, async (event) => {
       this.clock.setTime(event.timestamp);
       await this.emit(event);
-    }, (parsed) => {
+    }, totalLines, (parsed, total) => {
       process.stdout.clearLine?.(0);
       process.stdout.cursorTo?.(0);
-      process.stdout.write(`${prefix}${(parsed / 1000).toFixed(0)}K events`);
+      const pct = total > 0 ? ((parsed / total) * 100).toFixed(1) : '0.0';
+      process.stdout.write(`${prefix}${parsed}/${total} (${pct}%)`);
     });
     process.stdout.write('\n');
 

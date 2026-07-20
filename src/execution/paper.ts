@@ -30,17 +30,19 @@ export class PaperExecutor {
   }
 
   buy(mint: string, price: number, timestamp: number): OpenPosition | null {
-    const cost = this.solAmount * price;
-    if (cost > this.balance) return null;
+    const cost = this.solAmount;
+    if (cost > this.balance || price <= 0) return null;
 
     this.balance -= cost;
     tradeCounter++;
+
+    const quantity = cost / price;
 
     const position: OpenPosition = {
       id: `trade_${tradeCounter}`,
       mint,
       entryPrice: price,
-      quantity: this.solAmount,
+      quantity,
       entryTime: timestamp,
       highestPrice: price,
       stopLoss: this.positionManager.calcStopLoss(price),

@@ -1,10 +1,32 @@
 import type { ReplayEvent } from '../types/replay.ts';
 
 export class Parser {
+  async countLines(compressed: Uint8Array): Promise<number> {
+    const proc = Bun.spawn(['zstd', '-d'], {
+      stdin: compressed,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    const reader = proc.stdout.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+    let lines = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const byte of value) {
+        if (byte === 0x0a) lines++;
+      }
+    }
+
+    return lines;
+  }
+
   async parseStream(
     compressed: Uint8Array,
     onEvent: (event: ReplayEvent) => void,
-    onProgress?: (parsedEvents: number) => void,
+    totalLines?: number,
+    onProgress?: (parsed: number, total: number, percent: number) => void,
   ): Promise<number> {
     const proc = Bun.spawn(['zstd', '-d'], {
       stdin: compressed,
@@ -42,7 +64,7 @@ export class Parser {
 
       if (onProgress && count >= nextReport) {
         nextReport = count + 10_000;
-        onProgress(count);
+        onProgress(count, totalLines ?? count, 0);
       }
     }
 
@@ -55,7 +77,7 @@ export class Parser {
       }
     }
 
-    onProgress?.(count);
+    onProgress?.(count, totalLines ?? count, 100);
     return count;
   }
 }

@@ -113,10 +113,15 @@ async function cmdReplay(ctx: Context): Promise<void> {
     const tradeRepo = new TradeRepository();
 
     player.onEvent((event) => {
+      if (!event.mint || !event.mint.endsWith('pump')) return;
+      if (event.action !== 'buy' && event.action !== 'sell' && event.action !== 'create') return;
       const snapshot = featureBuilder.fromReplayEvent(event);
+      if (!snapshot) return;
       const { decision, score } = strategy.evaluate(snapshot);
       if (decision === 'BUY') router.execute(decision, snapshot);
-      const priceMap = new Map([[event.mint, event.price]]);
+      const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
+      const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
+      const priceMap = new Map([[event.mint, price]]);
       const exited = router.updatePositions(priceMap, event.timestamp);
       for (const trade of exited) tradeRepo.save(trade);
     });
