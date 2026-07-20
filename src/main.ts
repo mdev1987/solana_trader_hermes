@@ -45,7 +45,7 @@ export async function main() {
       break;
     default:
       console.log(`Usage: bun run main.ts <command>`);
-      console.log('  replay   - Replay recent hours and run strategy');
+      console.log('  replay   - Replay recent hours (default 2). Flags: --hour YYYY/MM/DD/HH, --file <path>, --no-cache');
       console.log('  rank     - Fetch and display current rankings');
       console.log('  heatmap  - Fetch and display heatmap data');
       console.log('  optimize - Run grid search optimization');
@@ -92,8 +92,27 @@ async function runReplay(args: string[]): Promise<void> {
     snapshotCache.set(event.mint, { ...snapshot, rankScore: score });
   });
 
-  console.log(`[replay] Downloading last ${hoursCount} hours...`);
-  const count = await player.replayRecent(hoursCount);
+  let count = 0;
+
+  const hourIdx = args.indexOf('--hour');
+  if (hourIdx !== -1 && args[hourIdx + 1]) {
+    const parts = args[hourIdx + 1]!.split(/[/:]/);
+    if (parts.length === 4) {
+      const hour = { year: Number(parts[0]!), month: Number(parts[1]!), day: Number(parts[2]!), hour: Number(parts[3]!) };
+      count = await player.replayHours([hour], `hour`);
+    }
+  }
+
+  const fileIdx = args.indexOf('--file');
+  if (fileIdx !== -1 && args[fileIdx + 1]) {
+    count += await player.replayFile(args[fileIdx + 1]!);
+  }
+
+  if (!args.includes('--hour') && !args.includes('--file')) {
+    console.log(`[replay] Downloading last ${hoursCount} hours...`);
+    count = await player.replayRecent(hoursCount);
+  }
+
   console.log(`[replay] Processed ${count} events`);
 
   const trades = executor.getTrades();

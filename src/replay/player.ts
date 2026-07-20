@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { Downloader } from './downloader.ts';
 import { Parser } from './parser.ts';
 import { VirtualClock } from './virtual_clock.ts';
@@ -89,5 +90,21 @@ export class Player {
   async replayRecent(hoursCount: number): Promise<number> {
     const hours = getRecentHours(hoursCount);
     return this.replayHours(hours, `${hoursCount}h`);
+  }
+
+  async replayFile(filePath: string): Promise<number> {
+    console.log(`[file] ${filePath}`);
+    const data = readFileSync(filePath);
+    const events = this.parser.parse(data);
+    events.sort((a, b) => a.timestamp - b.timestamp);
+
+    let count = 0;
+    for (const event of events) {
+      this.clock.setTime(event.timestamp);
+      await this.emit(event);
+      count++;
+    }
+
+    return count;
   }
 }
