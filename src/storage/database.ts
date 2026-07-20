@@ -1,3 +1,5 @@
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { ENV } from '../config/env.ts';
 
@@ -5,6 +7,7 @@ let dbInstance: Database | null = null;
 
 export function getDb(): Database {
   if (!dbInstance) {
+    mkdirSync(dirname(ENV.DB_PATH), { recursive: true });
     dbInstance = new Database(ENV.DB_PATH, { create: true });
     dbInstance.run('PRAGMA journal_mode = WAL');
     dbInstance.run('PRAGMA synchronous = NORMAL');

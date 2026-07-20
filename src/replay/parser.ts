@@ -1,8 +1,19 @@
 import type { ReplayEvent } from '../types/replay.ts';
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let zstd: any = null;
+
+async function getZstd() {
+  if (!zstd) {
+    const { ZstdInit } = await import('@oneidentity/zstd-js');
+    zstd = await ZstdInit();
+  }
+  return zstd;
+}
+
 export class Parser {
   async decompress(compressed: Uint8Array): Promise<string> {
-    const { ZstdSimple } = await import('@oneidentity/zstd-js');
+    const { ZstdSimple } = await getZstd();
     const decompressed = ZstdSimple.decompress(compressed);
     const decoder = new TextDecoder();
     return decoder.decode(decompressed);
