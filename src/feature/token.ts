@@ -14,6 +14,8 @@ export class TokenFeatureExtractor {
       holders: rank.market_info.holders,
       activityScore: rank.activity_score,
       smartWallets: rank.smart_wallet_total_count,
+      buyRatio: 0,
+      timeSinceLaunchMs: 0,
     };
   }
 }

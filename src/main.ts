@@ -67,6 +67,9 @@ async function runReplay(args: string[]): Promise<void> {
   const executor = new PaperExecutor(config, ENV.PAPER_BALANCE, ENV.PAPER_SOL_AMOUNT);
   const router = new ExecutionRouter(executor);
   const tradeRepo = new TradeRepository();
+  const COOLDOWN_MS = 300_000;
+  const MAX_POSITIONS = 10;
+  const recentlySold = new Map<string, number>();
   const featureRepo = new FeatureRepository();
   const snapshotCache = new Map<string, FeatureSnapshot>();
 
@@ -84,14 +87,24 @@ async function runReplay(args: string[]): Promise<void> {
 
     const { decision, score } = strategy.evaluate(snapshot);
     if (decision === 'BUY') {
-      const pos = router.execute(decision, snapshot);
-      if (pos) console.log(`[BUY] ${event.mint} score=${score.toFixed(1)} price=${price.toExponential(3)}`);
+      const soldAt = recentlySold.get(event.mint);
+      if (soldAt && event.timestamp - soldAt < COOLDOWN_MS) return;
+      const positions = router.getPaper().getPositions();
+      if (positions.has(event.mint)) return;
+      if (positions.size >= MAX_POSITIONS) return;
+      const pos = router.execute(decision, snapshot, price);
+      if (pos) {
+        const age = (snapshot.timeSinceLaunchMs / 1000).toFixed(1);
+        const br = snapshot.buyRatio.toFixed(2);
+        console.log(`[BUY] ${event.mint} score=${score.toFixed(1)} age=${age}s buyR=${br} price=${price.toExponential(3)}`);
+      }
     }
 
     const priceMap = new Map([[event.mint, price]]);
     const exited = router.updatePositions(priceMap, event.timestamp);
     for (const trade of exited) {
       console.log(`[SELL] ${trade.mint} pnl=${trade.pnl.toFixed(4)} (${(trade.pnlPercent * 100).toFixed(2)}%) reason=${trade.exitReason}`);
+      recentlySold.set(trade.mint, event.timestamp);
       tradeRepo.save(trade);
       featureRepo.save(snapshot);
     }

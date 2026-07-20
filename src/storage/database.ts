@@ -62,6 +62,9 @@ export function initDb(): void {
     )
   `);
 
+  try { db.run('ALTER TABLE features ADD COLUMN buy_ratio REAL DEFAULT 0'); } catch {}
+  try { db.run('ALTER TABLE features ADD COLUMN time_since_launch REAL DEFAULT 0'); } catch {}
+
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_features_mint ON features(mint)
   `);

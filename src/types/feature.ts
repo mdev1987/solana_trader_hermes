@@ -9,4 +9,6 @@ export interface FeatureSnapshot {
   holders: number;
   activityScore: number;
   smartWallets: number;
+  buyRatio: number;
+  timeSinceLaunchMs: number;
 }

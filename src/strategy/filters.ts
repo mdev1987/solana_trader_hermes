@@ -10,9 +10,8 @@ export class Filters {
 
   passes(snapshot: FeatureSnapshot): boolean {
     if (snapshot.liquidity < this.config.minLiquidity) return false;
-    if (snapshot.activityScore < this.config.minActivityScore) return false;
-    if (snapshot.holders > this.config.maxHolders) return false;
-    if (snapshot.smartWallets < this.config.minSmartWallets) return false;
+    if (snapshot.timeSinceLaunchMs < 0) return false;
+    if (snapshot.buyRatio < 0.3) return false;
     return true;
   }
 }

@@ -5,8 +5,8 @@ export class FeatureRepository {
   save(snapshot: FeatureSnapshot): void {
     const db = getDb();
     db.run(
-      `INSERT OR REPLACE INTO features (mint, timestamp, rank_score, signal_count, wallet_count, trade_volume, liquidity, holders, activity_score, smart_wallets)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO features (mint, timestamp, rank_score, signal_count, wallet_count, trade_volume, liquidity, holders, activity_score, smart_wallets, buy_ratio, time_since_launch)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         snapshot.mint,
         snapshot.timestamp,
@@ -18,6 +18,8 @@ export class FeatureRepository {
         snapshot.holders,
         snapshot.activityScore,
         snapshot.smartWallets,
+        snapshot.buyRatio,
+        snapshot.timeSinceLaunchMs,
       ],
     );
   }
@@ -65,6 +67,8 @@ export class FeatureRepository {
       holders: row.holders as number,
       activityScore: row.activity_score as number,
       smartWallets: row.smart_wallets as number,
+      buyRatio: (row.buy_ratio as number) ?? 0,
+      timeSinceLaunchMs: (row.time_since_launch as number) ?? 0,
     };
   }
 }

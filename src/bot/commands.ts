@@ -112,18 +112,32 @@ async function cmdReplay(ctx: Context): Promise<void> {
     const router = new ExecutionRouter(executor);
     const tradeRepo = new TradeRepository();
 
+    const recentlySold = new Map<string, number>();
+    const COOLDOWN_MS = 300_000;
+    const MAX_POSITIONS = 10;
+
     player.onEvent((event) => {
       if (!event.mint || !event.mint.endsWith('pump')) return;
       if (event.action !== 'buy' && event.action !== 'sell' && event.action !== 'create') return;
       const snapshot = featureBuilder.fromReplayEvent(event);
       if (!snapshot) return;
-      const { decision, score } = strategy.evaluate(snapshot);
-      if (decision === 'BUY') router.execute(decision, snapshot);
       const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
       const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
+      const { decision, score } = strategy.evaluate(snapshot);
+      if (decision === 'BUY') {
+        const soldAt = recentlySold.get(event.mint!);
+        if (soldAt && event.timestamp - soldAt < COOLDOWN_MS) return;
+        const positions = router.getPaper().getPositions();
+        if (positions.has(event.mint!)) return;
+        if (positions.size >= MAX_POSITIONS) return;
+        router.execute(decision, snapshot, price);
+      }
       const priceMap = new Map([[event.mint, price]]);
       const exited = router.updatePositions(priceMap, event.timestamp);
-      for (const trade of exited) tradeRepo.save(trade);
+      for (const trade of exited) {
+        recentlySold.set(trade.mint, event.timestamp);
+        tradeRepo.save(trade);
+      }
     });
 
     const count = await player.replayRecent(hoursCount);

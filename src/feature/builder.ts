@@ -83,7 +83,8 @@ export class FeatureBuilder {
     const eventsPerMin = s.eventCount / (timeSpan / 60000);
     const activityScore = Math.min(eventsPerMin / 100, 1);
     const walletCount = s.wallets.size;
-    const price = s.lastTokenAmount > 0 ? s.lastQuoteAmount / s.lastTokenAmount : 0;
+    const buyRatio = s.eventCount > 0 ? s.buyCount / s.eventCount : 0;
+    const timeSinceLaunchMs = event.timestamp - s.firstSeen;
 
     return {
       mint: event.mint,
@@ -96,6 +97,8 @@ export class FeatureBuilder {
       holders: walletCount,
       activityScore,
       smartWallets: 0,
+      buyRatio,
+      timeSinceLaunchMs,
     };
   }
 
@@ -115,6 +118,8 @@ export class FeatureBuilder {
       holders: 0,
       activityScore: this.marketExtractor.signalLevelToScore(signal.token_level),
       smartWallets: 0,
+      buyRatio: 0,
+      timeSinceLaunchMs: 0,
     };
   }
 

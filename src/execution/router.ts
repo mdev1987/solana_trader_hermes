@@ -10,9 +10,9 @@ export class ExecutionRouter {
     this.paper = paper;
   }
 
-  execute(decision: Decision, snapshot: FeatureSnapshot): OpenPosition | null {
-    if (decision !== 'BUY') return null;
-    return this.paper.buy(snapshot.mint, snapshot.rankScore > 0 ? 1 : 0.001, snapshot.timestamp);
+  execute(decision: Decision, snapshot: FeatureSnapshot, price: number): OpenPosition | null {
+    if (decision !== 'BUY' || price <= 0) return null;
+    return this.paper.buy(snapshot.mint, price, snapshot.timestamp);
   }
 
   updatePositions(priceMap: Map<string, number>, timestamp: number): TradeResult[] {
