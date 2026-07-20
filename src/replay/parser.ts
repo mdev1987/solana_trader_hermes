@@ -1,61 +1,61 @@
-import { spawnSync } from 'bun';
 import type { ReplayEvent } from '../types/replay.ts';
 
-const NEWLINE = 0x0A;
-
-export type ParseProgress = (parsed: number, total: number) => void;
-
 export class Parser {
-  decompress(compressed: Uint8Array): Buffer {
-    const proc = spawnSync(['zstd', '-d'], {
+  async parseStream(
+    compressed: Uint8Array,
+    onEvent: (event: ReplayEvent) => void,
+    onProgress?: (parsedEvents: number) => void,
+  ): Promise<number> {
+    const proc = Bun.spawn(['zstd', '-d'], {
       stdin: compressed,
       stdout: 'pipe',
       stderr: 'pipe',
     });
 
-    if (proc.exitCode !== 0) {
-      const stderr = (proc.stderr || '').toString();
-      throw new Error(`zstd decompression failed (exit ${proc.exitCode}): ${stderr}`);
-    }
+    const reader = proc.stdout.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+    const decoder = new TextDecoder();
 
-    return proc.stdout as Buffer;
-  }
+    let buffer = '';
+    let count = 0;
+    let nextReport = 10_000;
 
-  parseLines(buf: Buffer, onProgress?: ParseProgress): ReplayEvent[] {
-    const events: ReplayEvent[] = [];
-    let start = 0;
-    const total = buf.length;
-    let nextReport = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    while (start < buf.length) {
-      const end = buf.indexOf(NEWLINE, start);
-      if (end === -1) break;
+      buffer += decoder.decode(value, { stream: true });
 
-      if (end > start) {
-        const line = buf.toString('utf-8', start, end).trim();
+      let idx: number;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+
         if (line) {
           try {
-            events.push(JSON.parse(line) as ReplayEvent);
+            onEvent(JSON.parse(line) as ReplayEvent);
+            count++;
           } catch {
             console.warn('[parser] skipping invalid JSON line');
           }
         }
       }
 
-      start = end + 1;
-
-      if (onProgress && start >= nextReport) {
-        nextReport = start + Math.floor(total / 100);
-        onProgress(start, total);
+      if (onProgress && count >= nextReport) {
+        nextReport = count + 10_000;
+        onProgress(count);
       }
     }
 
-    if (onProgress) onProgress(total, total);
-    return events;
-  }
+    if (buffer.trim()) {
+      try {
+        onEvent(JSON.parse(buffer.trim()) as ReplayEvent);
+        count++;
+      } catch {
+        console.warn('[parser] skipping trailing data');
+      }
+    }
 
-  parse(compressed: Uint8Array, onProgress?: ParseProgress): ReplayEvent[] {
-    const buf = this.decompress(compressed);
-    return this.parseLines(buf, onProgress);
+    onProgress?.(count);
+    return count;
   }
 }

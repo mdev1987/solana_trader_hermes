@@ -67,30 +67,20 @@ export class Player {
       process.stdout.write('\n');
       if (!result) continue;
 
-      const { data, fromCache } = result;
-      if (fromCache) {
-        console.log(`${prefix}Using cached ${cachePath}`);
-      }
+      const { data } = result;
 
-      process.stdout.write(`${prefix}Decompressing...`);
-      const events = this.parser.parse(data, (parsed, total) => {
+      const hourCount = await this.parser.parseStream(data, async (event) => {
+        this.clock.setTime(event.timestamp);
+        await this.emit(event);
+      }, (parsed) => {
         process.stdout.clearLine?.(0);
         process.stdout.cursorTo?.(0);
-        const pct = total > 0 ? Math.round((parsed / total) * 100) : 0;
-        const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
-        process.stdout.write(`${prefix}Parsing ${bar} ${pct}%`);
+        process.stdout.write(`${prefix}${(parsed / 1000).toFixed(0)}K events`);
       });
       process.stdout.write('\n');
 
-      events.sort((a, b) => a.timestamp - b.timestamp);
-
-      for (const event of events) {
-        this.clock.setTime(event.timestamp);
-        await this.emit(event);
-        count++;
-      }
-
-      this.replayRepo.markProcessed(hour, events.length);
+      count += hourCount;
+      this.replayRepo.markProcessed(hour, hourCount);
     }
 
     return count;
@@ -106,24 +96,15 @@ export class Player {
     console.log(`${prefix}${filePath}`);
     const data = readFileSync(filePath);
 
-    process.stdout.write(`${prefix}Decompressing...`);
-    const events = this.parser.parse(data, (parsed, total) => {
-      process.stdout.clearLine?.(0);
-      process.stdout.cursorTo?.(0);
-      const pct = total > 0 ? Math.round((parsed / total) * 100) : 0;
-      const bar = '█'.repeat(Math.floor(pct / 5)) + '░'.repeat(20 - Math.floor(pct / 5));
-      process.stdout.write(`${prefix}Parsing ${bar} ${pct}%`);
-    });
-    process.stdout.write('\n');
-
-    events.sort((a, b) => a.timestamp - b.timestamp);
-
-    let count = 0;
-    for (const event of events) {
+    const count = await this.parser.parseStream(data, async (event) => {
       this.clock.setTime(event.timestamp);
       await this.emit(event);
-      count++;
-    }
+    }, (parsed) => {
+      process.stdout.clearLine?.(0);
+      process.stdout.cursorTo?.(0);
+      process.stdout.write(`${prefix}${(parsed / 1000).toFixed(0)}K events`);
+    });
+    process.stdout.write('\n');
 
     return count;
   }
