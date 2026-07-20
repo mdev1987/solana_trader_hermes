@@ -9,7 +9,17 @@ export function buildReplayUrl(hour: ReplayHour): string {
   return `${ENV.REPLAY_BASE_URL}/${y}/${m}/${d}/${h}.jsonl.zst`;
 }
 
-export async function fetchReplayHour(hour: ReplayHour, allowGaps = false): Promise<Uint8Array | null> {
+export interface DownloadProgress {
+  received: number;
+  total: number;
+  percent: number;
+}
+
+export async function fetchReplayHour(
+  hour: ReplayHour,
+  allowGaps = false,
+  onProgress?: (p: DownloadProgress) => void,
+): Promise<Uint8Array | null> {
   const url = buildReplayUrl(hour);
   const res = await fetch(url);
 
@@ -24,7 +34,38 @@ export async function fetchReplayHour(hour: ReplayHour, allowGaps = false): Prom
     throw new Error(`Replay API returned ${res.status}: ${url}`);
   }
 
-  return new Uint8Array(await res.arrayBuffer());
+  const total = Number(res.headers.get('content-length')) || 0;
+  const reader = res.body?.getReader();
+  if (!reader) {
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+
+    if (onProgress && total) {
+      onProgress({ received, total, percent: Math.round((received / total) * 100) });
+    }
+  }
+
+  const result = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  if (onProgress && total) {
+    onProgress({ received, total, percent: 100 });
+  }
+
+  return result;
 }
 
 export function getRecentHours(count: number): ReplayHour[] {

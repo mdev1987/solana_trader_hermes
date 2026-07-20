@@ -32,10 +32,24 @@ export class Player {
     }
   }
 
-  async replayHours(hours: ReplayHour[]): Promise<number> {
+  async replayHours(hours: ReplayHour[], label = ''): Promise<number> {
     let count = 0;
+    const prefix = label ? `[${label}] ` : '';
     for (const hour of hours) {
+      const url = `${String(hour.year)}/${String(hour.month).padStart(2, '0')}/${String(hour.day).padStart(2, '0')}/${String(hour.hour).padStart(2, '0')}.jsonl.zst`;
+      process.stdout.write(`${prefix}Downloading ${url} ... 0%`);
+
+      this.downloader.onProgress = (p) => {
+        process.stdout.clearLine?.(0);
+        process.stdout.cursorTo?.(0);
+        const bar = '█'.repeat(Math.floor(p.percent / 5)) + '░'.repeat(20 - Math.floor(p.percent / 5));
+        const mb = (p.received / 1_048_576).toFixed(1);
+        const totalMb = (p.total / 1_048_576).toFixed(1);
+        process.stdout.write(`${prefix}${bar} ${p.percent}% (${mb}MB / ${totalMb}MB)`);
+      };
+
       const compressed = await this.downloader.download(hour);
+      process.stdout.write('\n');
       if (!compressed) continue;
 
       const events = await this.parser.parse(compressed);
@@ -52,6 +66,6 @@ export class Player {
 
   async replayRecent(hoursCount: number): Promise<number> {
     const hours = getRecentHours(hoursCount);
-    return this.replayHours(hours);
+    return this.replayHours(hours, `${hoursCount}h`);
   }
 }

@@ -1,22 +1,20 @@
+import { spawnSync } from 'bun';
 import type { ReplayEvent } from '../types/replay.ts';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let zstd: any = null;
-
-async function getZstd() {
-  if (!zstd) {
-    const { ZstdInit } = await import('@oneidentity/zstd-js');
-    zstd = await ZstdInit();
-  }
-  return zstd;
-}
-
 export class Parser {
-  async decompress(compressed: Uint8Array): Promise<string> {
-    const { ZstdSimple } = await getZstd();
-    const decompressed = ZstdSimple.decompress(compressed);
-    const decoder = new TextDecoder();
-    return decoder.decode(decompressed);
+  decompress(compressed: Uint8Array): string {
+    const proc = spawnSync(['zstd', '-d'], {
+      stdin: compressed,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+
+    if (proc.exitCode !== 0) {
+      const stderr = (proc.stderr || '').toString();
+      throw new Error(`zstd decompression failed (exit ${proc.exitCode}): ${stderr}`);
+    }
+
+    return Buffer.from(proc.stdout).toString();
   }
 
   parseLines(text: string): ReplayEvent[] {
@@ -34,8 +32,8 @@ export class Parser {
     return events;
   }
 
-  async parse(compressed: Uint8Array): Promise<ReplayEvent[]> {
-    const text = await this.decompress(compressed);
+  parse(compressed: Uint8Array): ReplayEvent[] {
+    const text = this.decompress(compressed);
     return this.parseLines(text);
   }
 }
