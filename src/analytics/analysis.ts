@@ -1,5 +1,6 @@
 import { initDb, getDb } from '../storage/database.ts';
 import { TradeRepository } from '../storage/trade_repository.ts';
+import type { RejectedSignal } from '../storage/rejected_signal_repository.ts';
 import { RejectedSignalRepository } from '../storage/rejected_signal_repository.ts';
 import { calculateMetrics } from './metrics.ts';
 import type { TradeResult } from '../types/trade.ts';
@@ -250,6 +251,33 @@ export function analyzeDb(csv = false): void {
         }
       }
 
+      if (belowMin.length > 0 && trades.length > 0) {
+        const getAccFeat = (t: TradeResult, key: string): number => {
+          const f = parseFeatures(t);
+          if (key in f) return Number(f[key]) || 0;
+          if (key === 'entryDelayMs') return t.entryDelayMs;
+          if (key === 'signalAgeMs') return t.signalAgeMs;
+          return 0;
+        };
+        const compareFeat = (label: string, accKey: string, rejKey: keyof RejectedSignal): void => {
+          const accVals = trades.map(t => getAccFeat(t, accKey)).filter(v => v > 0);
+          const rejVals = belowMin.map(r => r[rejKey] as number).filter(v => v > 0);
+          if (accVals.length === 0 || rejVals.length === 0) return;
+          const aAvg = accVals.reduce((s, v) => s + v, 0) / accVals.length;
+          const rAvg = rejVals.reduce((s, v) => s + v, 0) / rejVals.length;
+          const aMed = accVals.sort((a, b) => a - b)[Math.floor(accVals.length / 2)];
+          const rMed = rejVals.sort((a, b) => a - b)[Math.floor(rejVals.length / 2)];
+          const dir = aAvg > rAvg ? 'higher' : 'lower';
+          const delta = ((aAvg - rAvg) / rAvg * 100).toFixed(1);
+          console.log(`    ${label.padEnd(16)} ${dir.padStart(7)} by ${delta.padStart(7)}%  |  acc avg=${aAvg.toFixed(1)} rej avg=${rAvg.toFixed(1)}  |  acc med=${aMed.toFixed(1)} rej med=${rMed.toFixed(1)}`);
+        };
+        console.log(`\n  Feature comparison (accepted trades vs below_min_score signals):`);
+        compareFeat('walletCount', 'wallets', 'walletCount');
+        compareFeat('liquidity', 'liquidity', 'liquidity');
+        compareFeat('buyRatio', 'buyRatio', 'buyRatio');
+        compareFeat('signalAgeMs', 'signalAgeMs', 'signalAgeMs');
+      }
+
       // Pipeline summary using the same order as strategy flow
       const filterReasons = ['too_early', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score'];
       const reasonMap = new Map(byReason.map(r => [r.reason, r]));
@@ -294,12 +322,11 @@ export function analyzeDb(csv = false): void {
   console.log(`  Slippage-affected trades: ${slippageLosses}/${trades.length}`);
 
   // ── MFE / MAE Analysis ──
-  console.log('\n─── MFE / MAE Analysis ───');
-  const withMfe = trades.map(t => {
-    const mfe = t.maxPrice > 0 ? (t.maxPrice - t.entryPrice) / t.entryPrice : 0;
-    const mae = t.exitPrice < t.entryPrice ? (t.exitPrice - t.entryPrice) / t.entryPrice : 0;
-    return { ...t, mfe, mae };
-  });
+  console.log('\n─── MFE Analysis ───');
+  const withMfe = trades.map(t => ({
+    ...t,
+    mfe: t.maxPrice > 0 ? (t.maxPrice - t.entryPrice) / t.entryPrice : 0,
+  }));
   const loserMfe = withMfe.filter(t => t.pnl <= 0);
   const winnerMfe = withMfe.filter(t => t.pnl > 0);
   const mfeBins = [
@@ -335,34 +362,53 @@ export function analyzeDb(csv = false): void {
 
   // ── MAE (Maximum Adverse Excursion) ──
   console.log('\n─── MAE (Maximum Adverse Excursion) ───');
-  const withMae = trades.map(t => {
-    const maeLoser = t.pnl <= 0 ? (t.entryPrice - t.exitPrice) / t.entryPrice : 0;
-    const maeWinner = t.pnl > 0 ? 0 : maeLoser;
-    return { ...t, mae: Math.max(maeLoser, maeWinner) };
-  });
-  const loserMae = withMae.filter(t => t.pnl <= 0);
-  if (loserMae.length > 0) {
-    const avgMae = loserMae.reduce((s, t) => s + t.mae, 0) / loserMae.length * 100;
-    const minMae = Math.min(...loserMae.map(t => t.mae)) * 100;
-    const maxMae = Math.max(...loserMae.map(t => t.mae)) * 100;
-    console.log(`  Losses: avg MAE=${avgMae.toFixed(1)}%  range=[${minMae.toFixed(1)}%, ${maxMae.toFixed(1)}%]`);
-    const maeBins = [
-      { label: '0-10%',   fn: (t: typeof withMae[0]) => t.mae > 0 && t.mae <= 0.10 },
-      { label: '10-20%',  fn: (t: typeof withMae[0]) => t.mae > 0.10 && t.mae <= 0.20 },
-      { label: '20-30%',  fn: (t: typeof withMae[0]) => t.mae > 0.20 && t.mae <= 0.30 },
-      { label: '30-50%',  fn: (t: typeof withMae[0]) => t.mae > 0.30 && t.mae <= 0.50 },
-      { label: '50%+',    fn: (t: typeof withMae[0]) => t.mae > 0.50 },
-    ];
-    for (const bin of maeBins) {
-      const n = loserMae.filter(bin.fn).length;
-      if (n > 0) console.log(`    ${bin.label.padEnd(10)} ${n.toString().padStart(3)}/${loserMae.length} (${(n/loserMae.length*100).toFixed(0)}%)`);
+  const withMae = trades.map(t => ({
+    ...t,
+    mae: t.minPrice > 0 ? (t.entryPrice - t.minPrice) / t.entryPrice : (t.entryPrice - t.exitPrice) / t.entryPrice,
+  }));
+  const posMae = withMae.filter(t => t.mae > 0);
+  const hasMinPrice = trades.some(t => t.minPrice > 0);
+
+  if (posMae.length > 0) {
+    const avgMae = posMae.reduce((s, t) => s + t.mae, 0) / posMae.length * 100;
+    const maxMae = Math.max(...posMae.map(t => t.mae)) * 100;
+    console.log(`  All trades with adverse excursion: ${posMae.length}/${trades.length} avg MAE=${avgMae.toFixed(1)}%  max MAE=${maxMae.toFixed(1)}%`);
+    if (!hasMinPrice) console.log('  (no minPrice tracking in DB — MAE is exit drawdown, not true intra-trade)');
+    const loserMae = posMae.filter(t => t.pnl <= 0);
+    const winnerMae = posMae.filter(t => t.pnl > 0);
+    if (loserMae.length > 0) {
+      const avgL = loserMae.reduce((s, t) => s + t.mae, 0) / loserMae.length * 100;
+      console.log(`  Losses: avg MAE=${avgL.toFixed(1)}%  N=${loserMae.length}`);
+      const maeBins = [
+        { label: '0-10%',   fn: (t: typeof withMae[0]) => t.mae > 0 && t.mae <= 0.10 },
+        { label: '10-20%',  fn: (t: typeof withMae[0]) => t.mae > 0.10 && t.mae <= 0.20 },
+        { label: '20-30%',  fn: (t: typeof withMae[0]) => t.mae > 0.20 && t.mae <= 0.30 },
+        { label: '30-50%',  fn: (t: typeof withMae[0]) => t.mae > 0.30 && t.mae <= 0.50 },
+        { label: '50%+',    fn: (t: typeof withMae[0]) => t.mae > 0.50 },
+      ];
+      for (const bin of maeBins) {
+        const n = loserMae.filter(bin.fn).length;
+        if (n > 0) console.log(`    ${bin.label.padEnd(10)} ${n.toString().padStart(3)}/${loserMae.length} (${(n/loserMae.length*100).toFixed(0)}%)`);
+      }
+    }
+    if (winnerMae.length > 0 && hasMinPrice) {
+      const avgW = winnerMae.reduce((s, t) => s + t.mae, 0) / winnerMae.length * 100;
+      console.log(`  Winners: avg MAE=${avgW.toFixed(1)}%  N=${winnerMae.length} (intra-trade drawdown before recovery)`);
+      const wBins = [
+        { label: '0-5%',    fn: (t: typeof withMae[0]) => t.mae > 0 && t.mae <= 0.05 },
+        { label: '5-10%',   fn: (t: typeof withMae[0]) => t.mae > 0.05 && t.mae <= 0.10 },
+        { label: '10-20%',  fn: (t: typeof withMae[0]) => t.mae > 0.10 && t.mae <= 0.20 },
+        { label: '20-30%',  fn: (t: typeof withMae[0]) => t.mae > 0.20 && t.mae <= 0.30 },
+        { label: '30%+',    fn: (t: typeof withMae[0]) => t.mae > 0.30 },
+      ];
+      for (const bin of wBins) {
+        const n = winnerMae.filter(bin.fn).length;
+        if (n > 0) console.log(`    ${bin.label.padEnd(10)} ${n.toString().padStart(3)}/${winnerMae.length} (${(n/winnerMae.length*100).toFixed(0)}%)`);
+      }
+    } else if (winnerMae.length > 0) {
+      console.log(`  Winners: ${winnerMae.length} trades with MAE data (re-run replay for intra-trade minPrice tracking)`);
     }
   }
-  const winnersMae = withMae.filter(t => t.pnl > 0);
-  if (winnersMae.length > 0) {
-    console.log(`  Winners: no intra-trade low tracked (need minPrice tracking in position manager)`);
-  }
-  console.log(`  Note: MAE for losers = exit drawdown (no bounce). MAE for winners needs minPrice tracking.`);
 
   // ── Score Calibration ──
   console.log('\n─── Score Calibration ───');

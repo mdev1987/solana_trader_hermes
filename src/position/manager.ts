@@ -32,6 +32,9 @@ export class PositionManager {
     if (currentPrice > pos.highestPrice) {
       pos.highestPrice = currentPrice;
     }
+    if (currentPrice < pos.lowestPrice) {
+      pos.lowestPrice = currentPrice;
+    }
 
     if (this.stopLoss.isHit(currentPrice, pos.stopLoss)) {
       return 'sl';

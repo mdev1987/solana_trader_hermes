@@ -36,6 +36,15 @@ export class RejectedSignalRepository {
     );
   }
 
+  getAll(): RejectedSignal[] {
+    const db = getDb();
+    const rows = db.query(`
+      SELECT id, mint, timestamp, score, activity_score, buy_ratio, wallet_count, liquidity, signal_age_ms, reject_reason, price
+      FROM rejected_signals ORDER BY timestamp
+    `).all() as Record<string, unknown>[];
+    return rows.map(r => this.mapRow(r));
+  }
+
   getByReason(reason: string): RejectedSignal[] {
     const db = getDb();
     const rows = db.query(`

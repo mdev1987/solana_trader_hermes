@@ -4,6 +4,7 @@ export interface TradeResult {
   entryPrice: number;
   exitPrice: number;
   maxPrice: number;
+  minPrice: number;
   quantity: number;
   entryTime: number;
   exitTime: number;
@@ -25,6 +26,7 @@ export interface OpenPosition {
   quantity: number;
   entryTime: number;
   highestPrice: number;
+  lowestPrice: number;
   entryDelayMs: number;
   signalAgeMs: number;
   decisionPrice: number;

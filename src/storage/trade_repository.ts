@@ -5,14 +5,15 @@ export class TradeRepository {
   save(trade: TradeResult): void {
     const db = getDb();
     db.run(
-      `INSERT OR REPLACE INTO trades (id, mint, entry_price, exit_price, max_price, quantity, entry_time, exit_time, entry_delay_ms, signal_age_ms, decision_price, entry_score, pnl, pnl_percent, exit_reason, fees, features)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO trades (id, mint, entry_price, exit_price, max_price, min_price, quantity, entry_time, exit_time, entry_delay_ms, signal_age_ms, decision_price, entry_score, pnl, pnl_percent, exit_reason, fees, features)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         trade.id,
         trade.mint,
         trade.entryPrice,
         trade.exitPrice,
         trade.maxPrice,
+        trade.minPrice,
         trade.quantity,
         trade.entryTime,
         trade.exitTime,
@@ -72,6 +73,7 @@ export class TradeRepository {
       entryPrice: row.entry_price as number,
       exitPrice: row.exit_price as number,
       maxPrice: (row.max_price as number) ?? 0,
+      minPrice: (row.min_price as number) ?? 0,
       quantity: row.quantity as number,
       entryTime: row.entry_time as number,
       exitTime: row.exit_time as number,

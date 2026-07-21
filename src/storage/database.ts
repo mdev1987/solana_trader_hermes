@@ -70,6 +70,7 @@ export function initDb(): void {
   try { db.run('ALTER TABLE trades ADD COLUMN signal_age_ms INTEGER DEFAULT 0'); } catch {}
   try { db.run('ALTER TABLE trades ADD COLUMN decision_price REAL DEFAULT 0'); } catch {}
   try { db.run('ALTER TABLE trades ADD COLUMN entry_score REAL DEFAULT 0'); } catch {}
+  try { db.run('ALTER TABLE trades ADD COLUMN min_price REAL DEFAULT 0'); } catch {}
 
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_features_mint ON features(mint)
