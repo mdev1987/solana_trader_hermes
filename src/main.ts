@@ -68,7 +68,8 @@ async function runReplay(args: string[]): Promise<void> {
   const router = new ExecutionRouter(executor);
   const tradeRepo = new TradeRepository();
   const COOLDOWN_MS = 300_000;
-  const MAX_POSITIONS = 10;
+  const MAX_POSITIONS = 5;
+  const MIN_PRICE = 1e-10;
   const recentlySold = new Map<string, number>();
   const featureRepo = new FeatureRepository();
   const snapshotCache = new Map<string, FeatureSnapshot>();
@@ -79,6 +80,7 @@ async function runReplay(args: string[]): Promise<void> {
 
     const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
     const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
+    if (price < MIN_PRICE) return;
 
     const snapshot = featureBuilder.fromReplayEvent(event);
     if (!snapshot) return;

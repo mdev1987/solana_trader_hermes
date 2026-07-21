@@ -114,7 +114,8 @@ async function cmdReplay(ctx: Context): Promise<void> {
 
     const recentlySold = new Map<string, number>();
     const COOLDOWN_MS = 300_000;
-    const MAX_POSITIONS = 10;
+    const MAX_POSITIONS = 5;
+    const MIN_PRICE = 1e-10;
 
     player.onEvent((event) => {
       if (!event.mint || !event.mint.endsWith('pump')) return;
@@ -123,6 +124,7 @@ async function cmdReplay(ctx: Context): Promise<void> {
       if (!snapshot) return;
       const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
       const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
+      if (price < MIN_PRICE) return;
       const { decision, score } = strategy.evaluate(snapshot);
       if (decision === 'BUY') {
         const soldAt = recentlySold.get(event.mint!);

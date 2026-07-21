@@ -38,6 +38,6 @@ export class Scorer {
 
   private decayTime(ms: number): number {
     if (ms < 0) return 0;
-    return Math.exp(-ms / 30_000);
+    return Math.exp(-ms / 60_000);
   }
 }
