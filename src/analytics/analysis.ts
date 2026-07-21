@@ -266,24 +266,72 @@ export function analyzeDb(csv = false): void {
     console.log(`    Avg MFE of losers: ${avgMfe.toFixed(1)}%`);
   }
 
-  // ── Score Buckets ──
-  console.log('\n─── Score Buckets (by entryScore) ───');
+  // ── MAE (Maximum Adverse Excursion) ──
+  console.log('\n─── MAE (Maximum Adverse Excursion) ───');
+  const withMae = trades.map(t => {
+    const maeLoser = t.pnl <= 0 ? (t.entryPrice - t.exitPrice) / t.entryPrice : 0;
+    const maeWinner = t.pnl > 0 ? 0 : maeLoser;
+    return { ...t, mae: Math.max(maeLoser, maeWinner) };
+  });
+  const loserMae = withMae.filter(t => t.pnl <= 0);
+  if (loserMae.length > 0) {
+    const avgMae = loserMae.reduce((s, t) => s + t.mae, 0) / loserMae.length * 100;
+    const minMae = Math.min(...loserMae.map(t => t.mae)) * 100;
+    const maxMae = Math.max(...loserMae.map(t => t.mae)) * 100;
+    console.log(`  Losses: avg MAE=${avgMae.toFixed(1)}%  range=[${minMae.toFixed(1)}%, ${maxMae.toFixed(1)}%]`);
+    const maeBins = [
+      { label: '0-10%',   fn: (t: typeof withMae[0]) => t.mae > 0 && t.mae <= 0.10 },
+      { label: '10-20%',  fn: (t: typeof withMae[0]) => t.mae > 0.10 && t.mae <= 0.20 },
+      { label: '20-30%',  fn: (t: typeof withMae[0]) => t.mae > 0.20 && t.mae <= 0.30 },
+      { label: '30-50%',  fn: (t: typeof withMae[0]) => t.mae > 0.30 && t.mae <= 0.50 },
+      { label: '50%+',    fn: (t: typeof withMae[0]) => t.mae > 0.50 },
+    ];
+    for (const bin of maeBins) {
+      const n = loserMae.filter(bin.fn).length;
+      if (n > 0) console.log(`    ${bin.label.padEnd(10)} ${n.toString().padStart(3)}/${loserMae.length} (${(n/loserMae.length*100).toFixed(0)}%)`);
+    }
+  }
+  const winnersMae = withMae.filter(t => t.pnl > 0);
+  if (winnersMae.length > 0) {
+    console.log(`  Winners: no intra-trade low tracked (need minPrice tracking in position manager)`);
+  }
+  console.log(`  Note: MAE for losers = exit drawdown (no bounce). MAE for winners needs minPrice tracking.`);
+
+  // ── Score Calibration ──
+  console.log('\n─── Score Calibration ───');
   const scoreBuckets = [
     { label: '50-55', min: 50, max: 55 },
     { label: '55-60', min: 55, max: 60 },
     { label: '60-65', min: 60, max: 65 },
     { label: '65+',   min: 65, max: Infinity },
   ];
-  console.log(`  ${'Bucket'.padEnd(10)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'PnL'.padStart(12)} ${'PF'.padStart(6)} ${'AvgMFE'.padStart(9)}`);
+  console.log(`  ${'Bucket'.padEnd(10)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'AvgROI'.padStart(9)} ${'AvgMFE'.padStart(9)} ${'PF'.padStart(6)} ${'Calibrated?'.padStart(12)}`);
+  let prevRoi = -Infinity;
+  let monotonic = true;
   for (const b of scoreBuckets) {
     const subset = trades.filter(t => t.entryScore >= b.min && t.entryScore < b.max);
     if (subset.length === 0) continue;
     const sm = calculateMetrics(subset);
+    const avgRoi = subset.reduce((s, t) => s + t.pnlPercent, 0) / subset.length * 100;
     const avgMfe = subset.reduce((s, t) => {
       const mfe = t.maxPrice > 0 ? (t.maxPrice - t.entryPrice) / t.entryPrice : 0;
       return s + mfe;
     }, 0) / subset.length * 100;
-    console.log(`  ${b.label.padEnd(10)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor === Infinity ? '    ∞' : sm.profitFactor.toFixed(1).padStart(6)} ${avgMfe.toFixed(1).padStart(8)}%`);
+    if (avgRoi <= prevRoi) monotonic = false;
+    prevRoi = avgRoi;
+    const cal = avgRoi > prevRoi ? '✓' : '✗';
+    console.log(`  ${b.label.padEnd(10)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${avgRoi.toFixed(1).padStart(8)}% ${avgMfe.toFixed(1).padStart(8)}% ${sm.profitFactor === Infinity ? '  ∞' : sm.profitFactor.toFixed(1).padStart(5)} ${monotonic ? '✓ rising'.padStart(10) : '✗ broken'.padStart(10)}`);
+  }
+  console.log(`  Score → ROI monotonic: ${monotonic ? 'YES (well calibrated)' : 'NO (reweight needed)'}`);
+
+  // per-score detail
+  const sortedByScore = [...trades].sort((a, b) => a.entryScore - b.entryScore);
+  console.log('  Per-trade score vs ROI:');
+  console.log(`  ${'Score'.padStart(7)} ${'ROI'.padStart(9)} ${'Result'.padStart(8)}  Mint`);
+  for (const t of sortedByScore) {
+    const roi = (t.pnlPercent * 100).toFixed(1);
+    const result = t.pnl > 0 ? 'WIN' : 'LOSS';
+    console.log(`  ${t.entryScore.toFixed(1).padStart(7)} ${roi.padStart(8)}% ${result.padStart(8)}  ${t.mint.slice(0, 10)}…`);
   }
 
   // ── Score Component Breakdown ──
@@ -345,27 +393,42 @@ export function analyzeDb(csv = false): void {
 
   // ── Failure Reasons ──
   console.log('\n─── Failure Reasons ───');
-  const failures: Record<string, number> = {};
+  interface FailureCat { label: string; n: number; }
+  const failCats: FailureCat[] = [];
   for (const t of trades) {
     if (t.pnl > 0) continue;
+    const holdSec = (t.exitTime - t.entryTime) / 1000;
     const gapPct = Math.abs(t.pnlPercent) - 0.30;
-    if (t.maxPrice <= t.entryPrice) {
-      failures['Never profitable'] = (failures['Never profitable'] ?? 0) + 1;
+    const neverPos = t.maxPrice <= t.entryPrice;
+    let label: string;
+    if (neverPos && holdSec < 5) {
+      label = 'Immediate dump (never positive, <5s)';
+    } else if (neverPos) {
+      label = 'Slow bleed (never positive, ≥5s)';
     } else if (gapPct > 0.10) {
-      failures['Gap through stop (>10% below SL)'] = (failures['Gap through stop (>10% below SL)'] ?? 0) + 1;
+      label = 'Gap through stop (>10% below SL trigger)';
     } else if (t.exitReason === 'trailing') {
-      failures['Trailing reversal'] = (failures['Trailing reversal'] ?? 0) + 1;
+      label = 'Trailing reversal';
     } else if (t.exitReason === 'ttl') {
-      failures['Max hold time'] = (failures['Max hold time'] ?? 0) + 1;
+      label = 'Max hold time expired';
     } else {
-      failures['Hit SL (normal)'] = (failures['Hit SL (normal)'] ?? 0) + 1;
+      label = 'Hit SL (normal)';
     }
+    const existing = failCats.find(c => c.label === label);
+    if (existing) { existing.n++; } else { failCats.push({ label, n: 1 }); }
   }
   const nLosses = losers.length;
-  for (const [reason, count] of Object.entries(failures)) {
-    const pct = (count / nLosses * 100).toFixed(0);
-    console.log(`  ${reason.padEnd(36)} ${count.toString().padStart(3)}/${nLosses} (${pct}%)`);
+  failCats.sort((a, b) => b.n - a.n);
+  for (const c of failCats) {
+    const pct = (c.n / nLosses * 100).toFixed(0);
+    console.log(`  ${c.label.padEnd(42)} ${c.n.toString().padStart(3)}/${nLosses} (${pct}%)`);
   }
+  const immediateDumps = trades.filter(t => t.pnl <= 0 && t.maxPrice <= t.entryPrice && (t.exitTime - t.entryTime) / 1000 < 5).length;
+  const slowBleeds = trades.filter(t => t.pnl <= 0 && t.maxPrice <= t.entryPrice && (t.exitTime - t.entryTime) / 1000 >= 5).length;
+  console.log(`  ── Breakdown of never-profitable (${immediateDumps + slowBleeds}):`);
+  console.log(`    Immediate dump (<5s):  ${immediateDumps}`);
+  console.log(`    Slow bleed (≥5s):      ${slowBleeds}`);
+  console.log(`    Avg time to exit:      ${fmtHold(losers.reduce((s, t) => s + (t.exitTime - t.entryTime), 0) / nLosses)}`);
 
   // ── Liquidity Buckets ──
   console.log('\n─── Liquidity Buckets ───');
@@ -427,6 +490,44 @@ export function analyzeDb(csv = false): void {
   if (slTrades.length > 0) console.log(`  Losses <1m: ${fastLosses}/${slTrades.length} (${(fastLosses/slTrades.length*100).toFixed(0)}%)`);
   const earlyWins = tpTrades.filter(t => (t.exitTime - t.entryTime) < 120000).length;
   if (tpTrades.length > 0) console.log(`  Wins <2m: ${earlyWins}/${tpTrades.length} (${(earlyWins/tpTrades.length*100).toFixed(0)}%)`);
+
+  // ── Time to MFE (approximate) ──
+  console.log('\n─── Time to MFE (Maximum Favorable Excursion) ───');
+  const withTimeToMfe = trades.map(t => {
+    const mfe = t.maxPrice > 0 ? (t.maxPrice - t.entryPrice) / t.entryPrice : 0;
+    let timeToMfeMs: number;
+    let timeToMfeNote: string;
+    if (mfe <= 0) {
+      timeToMfeMs = 0;
+      timeToMfeNote = 'never positive';
+    } else if (t.exitReason === 'tp' || t.exitReason === 'trailing') {
+      timeToMfeMs = t.exitTime - t.entryTime;
+      timeToMfeNote = 'at exit (TP/trailing)';
+    } else {
+      timeToMfeMs = t.exitTime - t.entryTime;
+      timeToMfeNote = '≈ exit (no intra-trade tracking)';
+    }
+    return { ...t, mfe, timeToMfeMs, timeToMfeNote };
+  });
+  const posTrades = withTimeToMfe.filter(t => t.mfe > 0);
+  if (posTrades.length > 0) {
+    const avgTimeToMfe = posTrades.reduce((s, t) => s + t.timeToMfeMs, 0) / posTrades.length;
+    const minTimeToMfe = Math.min(...posTrades.map(t => t.timeToMfeMs));
+    const maxTimeToMfe = Math.max(...posTrades.map(t => t.timeToMfeMs));
+    console.log(`  Positive-MFE trades: avg=${fmtHold(avgTimeToMfe)}  range=[${fmtHold(minTimeToMfe)}, ${fmtHold(maxTimeToMfe)}]`);
+    const fastPeak = posTrades.filter(t => t.timeToMfeMs < 60000).length;
+    console.log(`  MFE reached <1m: ${fastPeak}/${posTrades.length} (${(fastPeak/posTrades.length*100).toFixed(0)}%)`);
+    const mfePositive = withTimeToMfe.filter(t => t.mfe > 0);
+    for (const t of mfePositive) {
+      const mfePct = (t.mfe * 100).toFixed(1);
+      const ttMfe = fmtHold(t.timeToMfeMs);
+      const result = t.pnl > 0 ? 'WIN' : 'LOSS';
+      console.log(`    ${result.padStart(5)}  MFE=${mfePct.padStart(6)}%  time-to-MFE=${ttMfe.padStart(7)}  ${t.timeToMfeNote}  ${t.mint.slice(0, 10)}…`);
+    }
+  } else {
+    console.log('  No trades reached positive MFE.');
+  }
+  console.log(`  Note: time-to-MFE requires per-tick price tracking for precision.`);
 
   // ── Equity Curve ──
   console.log('\n─── Equity Curve (by trade sequence) ───');
