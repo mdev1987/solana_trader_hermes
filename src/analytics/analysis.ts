@@ -151,6 +151,60 @@ export function analyzeDb(csv = false): void {
     console.log('  (not enough data — need both winners and losers)');
   }
 
+  // ── Feature Importance (Correlation with PnL) ──
+  console.log('\n─── Feature Importance (correlation with PnL) ───');
+  const importanceFeatures = ['entryScore', 'activity', 'buyRatio', 'wallets', 'liquidity', 'entryDelayMs', 'signalAgeMs'];
+  const getImportanceVal = (key: string, t: TradeResult): number => {
+    const f = parseFeatures(t);
+    if (key in f) return Number(f[key]) || 0;
+    if (key === 'entryDelayMs') return t.entryDelayMs;
+    if (key === 'signalAgeMs') return t.signalAgeMs;
+    if (key === 'entryScore') return t.entryScore;
+    return 0;
+  };
+
+  interface FeatImp { name: string; r: number; d: number; stars: string; }
+  const impRows: FeatImp[] = [];
+  for (const key of importanceFeatures) {
+    const vals = trades.map(t => getImportanceVal(key, t));
+    const outcomes = trades.map(t => t.pnl > 0 ? 1 : 0);
+    const n = vals.length;
+
+    const meanV = vals.reduce((s: number, v: number) => s + v, 0) / n;
+    const meanO = outcomes.reduce((s: number, v: number) => s + v, 0) / n;
+    let cov = 0, varV = 0, varO = 0;
+    for (let i = 0; i < n; i++) {
+      const dv = (vals[i] ?? 0) - meanV;
+      const do_ = (outcomes[i] ?? 0) - meanO;
+      cov += dv * do_;
+      varV += dv * dv;
+      varO += do_ * do_;
+    }
+    const r = varV > 0 && varO > 0 ? cov / Math.sqrt(varV * varO) : 0;
+
+    const winVals = trades.filter(t => t.pnl > 0).map(t => getImportanceVal(key, t)) as number[];
+    const loseVals = trades.filter(t => t.pnl <= 0).map(t => getImportanceVal(key, t)) as number[];
+    let d = 0;
+    if (winVals.length > 0 && loseVals.length > 0) {
+      const wMean = winVals.reduce((s: number, v: number) => s + v, 0) / winVals.length;
+      const lMean = loseVals.reduce((s: number, v: number) => s + v, 0) / loseVals.length;
+      const wVar = winVals.reduce((s: number, v: number) => s + (v - wMean) ** 2, 0) / winVals.length;
+      const lVar = loseVals.reduce((s: number, v: number) => s + (v - lMean) ** 2, 0) / loseVals.length;
+      const pooled = Math.sqrt((wVar + lVar) / 2);
+      d = pooled > 0 ? (wMean - lMean) / pooled : 0;
+    }
+
+    const absR = Math.abs(r);
+    const stars = absR > 0.5 ? '⭐⭐⭐⭐⭐' : absR > 0.4 ? '⭐⭐⭐⭐' : absR > 0.3 ? '⭐⭐⭐' : absR > 0.2 ? '⭐⭐' : absR > 0.1 ? '⭐' : '—';
+    impRows.push({ name: key, r, d, stars });
+  }
+
+  impRows.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+  console.log(`  ${'Feature'.padEnd(16)} ${'r (corr)'.padStart(10)} ${"Cohen's d".padStart(10)} ${'Power'.padStart(8)}`);
+  for (const row of impRows) {
+    console.log(`  ${row.name.padEnd(16)} ${row.r.toFixed(4).padStart(10)} ${row.d.toFixed(4).padStart(10)} ${row.stars.padStart(8)}`);
+  }
+
   // ── Execution Analysis ──
   console.log('\n─── Execution Analysis ───');
   const delays = trades.map(t => t.entryDelayMs);
