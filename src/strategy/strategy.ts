@@ -16,13 +16,14 @@ export class Strategy {
   }
 
   evaluate(snapshot: FeatureSnapshot): { decision: Decision; score: number; reason: string } {
-    if (!this.filters.passes(snapshot)) {
-      return { decision: 'SKIP', score: 0, reason: 'filtered' };
+    const filterReason = this.filters.passes(snapshot);
+    if (filterReason) {
+      return { decision: 'SKIP', score: 0, reason: filterReason };
     }
 
     const score = this.scorer.score(snapshot);
     const decision = this.decisionMaker.decide(score, snapshot);
-    return { decision, score, reason: decision === 'BUY' ? `score=${score.toFixed(1)}` : 'below threshold' };
+    return { decision, score, reason: decision === 'BUY' ? `score=${score.toFixed(1)}` : 'below_min_score' };
   }
 
   evaluateBatch(snapshots: FeatureSnapshot[]): ScoredToken[] {

@@ -8,13 +8,13 @@ export class Filters {
     this.config = config;
   }
 
-  passes(snapshot: FeatureSnapshot): boolean {
-    if (snapshot.liquidity < this.config.minLiquidity) return false;
-    if (snapshot.liquidity > this.config.maxLiquidity) return false;
-    if (snapshot.timeSinceLaunchMs < 0) return false;
-    if (snapshot.timeSinceLaunchMs > this.config.maxSignalAgeMs) return false;
-    if (snapshot.walletCount > this.config.maxWallets) return false;
-    if (snapshot.buyRatio < 0.3) return false;
-    return true;
+  passes(snapshot: FeatureSnapshot): string | null {
+    if (snapshot.liquidity < this.config.minLiquidity) return `liquidity_below_min`;
+    if (snapshot.liquidity > this.config.maxLiquidity) return `liquidity_above_max`;
+    if (snapshot.timeSinceLaunchMs < 0) return `negative_age`;
+    if (snapshot.timeSinceLaunchMs > this.config.maxSignalAgeMs) return `signal_too_old`;
+    if (snapshot.walletCount > this.config.maxWallets) return `wallets_above_max`;
+    if (snapshot.buyRatio < 0.3) return `buy_ratio_too_low`;
+    return null;
   }
 }

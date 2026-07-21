@@ -1,5 +1,6 @@
 import { initDb, getDb } from '../storage/database.ts';
 import { TradeRepository } from '../storage/trade_repository.ts';
+import { RejectedSignalRepository } from '../storage/rejected_signal_repository.ts';
 import { calculateMetrics } from './metrics.ts';
 import type { TradeResult } from '../types/trade.ts';
 
@@ -203,6 +204,72 @@ export function analyzeDb(csv = false): void {
   console.log(`  ${'Feature'.padEnd(16)} ${'r (corr)'.padStart(10)} ${"Cohen's d".padStart(10)} ${'Power'.padStart(8)}`);
   for (const row of impRows) {
     console.log(`  ${row.name.padEnd(16)} ${row.r.toFixed(4).padStart(10)} ${row.d.toFixed(4).padStart(10)} ${row.stars.padStart(8)}`);
+  }
+
+  // ── Rejected Signals ──
+  console.log('\n─── Rejected Signals ───');
+  try {
+    const rejRepo = new RejectedSignalRepository();
+    const totalRejected = rejRepo.totalCount();
+    if (totalRejected === 0) {
+      console.log('  (none logged)');
+    } else {
+      console.log(`  Total rejected: ${totalRejected.toLocaleString()}`);
+
+      const byReason = rejRepo.countByReason();
+      console.log(`  ${'Reason'.padEnd(22)} ${'Count'.padStart(10)} ${'AvgScore'.padStart(10)}`);
+      for (const { reason, count, avgScore } of byReason) {
+        console.log(`  ${reason.padEnd(22)} ${count.toLocaleString().padStart(10)} ${avgScore.toFixed(1).padStart(10)}`);
+      }
+
+      // Score overlap: compare accepted trades vs rejected-by-score signals
+      const belowMin = rejRepo.getByReason('below_min_score');
+      if (belowMin.length > 0 && trades.length > 0) {
+        console.log(`\n  Score overlap (accepted vs rejected-by-score):`);
+        const acceptedScores = trades.map(t => t.entryScore);
+        const rejectedScores = belowMin.map(r => r.score);
+        const accAvg = acceptedScores.reduce((s, v) => s + v, 0) / acceptedScores.length;
+        const rejAvg = rejectedScores.reduce((s, v) => s + v, 0) / rejectedScores.length;
+        console.log(`    Accepted: ${acceptedScores.length} trades, avg score ${accAvg.toFixed(1)}`);
+        console.log(`    Rejected: ${rejectedScores.length} signals, avg score ${rejAvg.toFixed(1)}`);
+
+        const bucket = (s: number) => Math.floor(s / 5) * 5;
+        const accBuckets = new Map<number, number>();
+        const rejBuckets = new Map<number, number>();
+        for (const s of acceptedScores) accBuckets.set(bucket(s), (accBuckets.get(bucket(s)) ?? 0) + 1);
+        for (const s of rejectedScores) rejBuckets.set(bucket(s), (rejBuckets.get(bucket(s)) ?? 0) + 1);
+        const allBuckets = new Set([...accBuckets.keys(), ...rejBuckets.keys()]);
+        const sortedBuckets = [...allBuckets].sort((a, b) => a - b);
+        console.log(`    ${'Bucket'.padStart(8)} ${'Accepted'.padStart(10)} ${'Rejected'.padStart(10)}`);
+        for (const b of sortedBuckets) {
+          const aN = accBuckets.get(b) ?? 0;
+          const rN = rejBuckets.get(b) ?? 0;
+          if (aN > 0 || rN > 0) {
+            console.log(`    ${`${b}-${b+4}`.padStart(8)} ${String(aN).padStart(10)} ${String(rN).padStart(10)}`);
+          }
+        }
+      }
+
+      // Pipeline summary using the same order as strategy flow
+      const filterReasons = ['too_early', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score'];
+      const reasonMap = new Map(byReason.map(r => [r.reason, r]));
+      console.log(`\n  Rejection pipeline (top → bottom):`);
+      const pipeline: { reason: string; count: number; cumPct: string }[] = [];
+      let cumSum = 0;
+      for (const reason of filterReasons) {
+        const entry = reasonMap.get(reason);
+        if (entry && entry.count > 0) {
+          cumSum += entry.count;
+          pipeline.push({ reason, count: entry.count, cumPct: `${(cumSum / totalRejected * 100).toFixed(1)}%` });
+        }
+      }
+      console.log(`    ${'Stage'.padEnd(22)} ${'Blocked'.padStart(10)} ${'Cum%'.padStart(8)}`);
+      for (const p of pipeline) {
+        console.log(`    ${p.reason.padEnd(22)} ${p.count.toLocaleString().padStart(10)} ${p.cumPct.padStart(8)}`);
+      }
+    }
+  } catch (e) {
+    console.log(`  Error reading rejected signals: ${e}`);
   }
 
   // ── Execution Analysis ──

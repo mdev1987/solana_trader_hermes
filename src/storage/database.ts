@@ -82,4 +82,20 @@ export function initDb(): void {
   db.run(`
     CREATE INDEX IF NOT EXISTS idx_trades_mint ON trades(mint)
   `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS rejected_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      mint TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      score REAL NOT NULL,
+      activity_score REAL NOT NULL,
+      buy_ratio REAL NOT NULL,
+      wallet_count INTEGER NOT NULL,
+      liquidity REAL NOT NULL,
+      signal_age_ms INTEGER NOT NULL,
+      reject_reason TEXT NOT NULL,
+      price REAL NOT NULL
+    )
+  `);
 }

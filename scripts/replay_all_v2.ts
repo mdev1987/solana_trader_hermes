@@ -11,6 +11,7 @@ import { calculateMetrics, outlierReports } from '../src/analytics/metrics.ts';
 import { printReport, printOutlierReports } from '../src/analytics/report.ts';
 import { createConfig } from '../src/config/config.ts';
 import { ENV } from '../src/config/env.ts';
+import { logRejection } from '../src/strategy/rejection_logger.ts';
 import type { ReplayEvent } from '../src/types/replay.ts';
 import type { FeatureSnapshot } from '../src/types/feature.ts';
 import { readdirSync, existsSync } from 'node:fs';
@@ -147,10 +148,13 @@ async function main() {
 
       const snapshot = featureBuilder.fromReplayEvent(event);
       if (!snapshot) return;
-      if (snapshot.timeSinceLaunchMs < DECISION_DELAY_MS) return;
+      if (snapshot.timeSinceLaunchMs < DECISION_DELAY_MS) {
+        logRejection(event.mint, event.timestamp, snapshot, 0, 'too_early', price);
+        return;
+      }
       featureStore.set(snapshot);
 
-      const { decision, score } = strategy.evaluate(snapshot);
+      const { decision, score, reason } = strategy.evaluate(snapshot);
       snapshotCache.set(event.mint, { ...snapshot, rankScore: score });
       if (decision === 'BUY') {
         if (price < MIN_PRICE) return;
@@ -166,6 +170,8 @@ async function main() {
           decisionPrice: price,
         });
         console.log(`[SIGNAL] ${event.mint} score=${score.toFixed(1)} price=${price.toExponential(3)} delay=${DELAY_MS}ms`);
+      } else {
+        logRejection(event.mint, event.timestamp, snapshot, score, reason, price);
       }
 
       const priceMap = new Map([[event.mint, price]]);
