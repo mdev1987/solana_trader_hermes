@@ -2,11 +2,11 @@ import type { FeatureSnapshot } from '../types/feature.ts';
 
 export class Scorer {
   private weights = {
-    activityScore: 0.20,
-    buyRatio: 0.25,
-    timeSinceLaunch: 0.25,
-    liquidity: 0.15,
-    walletCount: 0.15,
+    activityScore: 0.25,
+    buyRatio: 0.30,
+    timeSinceLaunch: 0.15,
+    liquidity: 0.20,
+    walletCount: 0.10,
   };
 
   score(snapshot: FeatureSnapshot): number {
