@@ -21,8 +21,8 @@
   },
   "dependencies": {
     "@dotenvx/dotenvx": "^2.14.0",
-    "@oneidentity/zstd-js": "^1.0.3",
     "grammy": "^1.45.1",
+    "simple-zstd": "^2.1.0",
     "telegram-markdown-v2": "^0.0.5"
   }
 }

@@ -1,16 +1,24 @@
+import { decompress } from 'simple-zstd';
 import type { ReplayEvent } from '../types/replay.ts';
+
+function readChunks(stream: NodeJS.ReadableStream): ReadableStream<Buffer> {
+  return new ReadableStream({
+    start(controller) {
+      stream.on('data', (chunk: Buffer) => controller.enqueue(chunk));
+      stream.on('end', () => controller.close());
+      stream.on('error', (err) => controller.error(err));
+    },
+  });
+}
 
 export class Parser {
   async countLines(compressed: Uint8Array): Promise<number> {
-    const proc = Bun.spawn(['zstd', '-d'], {
-      stdin: compressed,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const d = await decompress();
+    const reader = readChunks(d).getReader();
+    d.write(Buffer.from(compressed));
+    d.end();
 
-    const reader = proc.stdout.getReader() as ReadableStreamDefaultReader<Uint8Array>;
     let lines = 0;
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -18,7 +26,6 @@ export class Parser {
         if (byte === 0x0a) lines++;
       }
     }
-
     return lines;
   }
 
@@ -28,15 +35,12 @@ export class Parser {
     totalLines?: number,
     onProgress?: (parsed: number, total: number, percent: number) => void,
   ): Promise<number> {
-    const proc = Bun.spawn(['zstd', '-d'], {
-      stdin: compressed,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
+    const d = await decompress();
+    const reader = readChunks(d).getReader();
+    d.write(Buffer.from(compressed));
+    d.end();
 
-    const reader = proc.stdout.getReader() as ReadableStreamDefaultReader<Uint8Array>;
     const decoder = new TextDecoder();
-
     let buffer = '';
     let count = 0;
     let nextReport = 10_000;

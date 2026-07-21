@@ -213,7 +213,7 @@ async function main() {
         console.log(`  done: ${count} events`);
         await sleep(100);
       } catch (e) {
-        console.error(`  ERROR on ${file}:`, e);
+        console.error(`  ERROR on ${filePath}:`, e);
         break;
       }
     }
