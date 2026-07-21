@@ -36,5 +36,8 @@ documents/
 # IntelliJ based IDEs
 .idea
 
+# opencode skill files
+.opencode/
+
 # Finder (MacOS) folder config
 .DS_Store
