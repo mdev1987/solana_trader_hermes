@@ -13,7 +13,8 @@ import { createConfig } from '../src/config/config.ts';
 import { ENV } from '../src/config/env.ts';
 import type { ReplayEvent } from '../src/types/replay.ts';
 import type { FeatureSnapshot } from '../src/types/feature.ts';
-import { readdirSync } from 'node:fs';
+import { readdirSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -30,16 +31,35 @@ const PENDING_BUY_TIMEOUT_MS = 10_000;
 const FILL_WINDOW_MS = 500;
 const DECISION_DELAY_MS = 2000;
 
-function replayDir(): string {
+function findReplayFiles(): string[] {
   const base = ENV.DATA_DIR;
-  return `${base}/replay/2026/07/20`;
+  const replayRoot = `${base}/replay`;
+  if (!existsSync(replayRoot)) return [];
+
+  const files: string[] = [];
+  for (const year of readdirSync(replayRoot).sort()) {
+    const yearPath = join(replayRoot, year);
+    if (!existsSync(yearPath)) continue;
+    for (const month of readdirSync(yearPath).sort()) {
+      const monthPath = join(yearPath, month);
+      if (!existsSync(monthPath)) continue;
+      for (const day of readdirSync(monthPath).sort()) {
+        const dayPath = join(monthPath, day);
+        if (!existsSync(dayPath)) continue;
+        for (const f of readdirSync(dayPath).sort()) {
+          if (f.endsWith('.jsonl.zst')) {
+            files.push(join(dayPath, f));
+          }
+        }
+      }
+    }
+  }
+  return files;
 }
 
 async function main() {
   try {
-    const files = readdirSync(replayDir())
-      .filter(f => f.endsWith('.jsonl.zst'))
-      .sort();
+    const files = findReplayFiles();
     console.log(`Found ${files.length} replay files`);
     initDb();
 
@@ -177,8 +197,7 @@ async function main() {
     };
 
     let totalCount = 0;
-    for (const file of files) {
-      const filePath = `${replayDir()}/${file}`;
+    for (const filePath of files) {
       console.log(`[file] ${filePath}`);
       const player = new Player();
       player.onEvent(handler);

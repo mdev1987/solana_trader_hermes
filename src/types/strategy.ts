@@ -5,6 +5,7 @@ export interface StrategyConfig {
   minLiquidity: number;
   maxLiquidity: number;
   maxSignalAgeMs: number;
+  maxDeadHoldMs: number;
   maxWallets: number;
   minActivityScore: number;
   maxHolders: number;

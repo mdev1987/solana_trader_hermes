@@ -13,7 +13,7 @@ export interface TradeResult {
   entryScore: number;
   pnl: number;
   pnlPercent: number;
-  exitReason: 'tp' | 'sl' | 'trailing' | 'ttl' | 'manual';
+  exitReason: 'tp' | 'sl' | 'trailing' | 'ttl' | 'dead' | 'manual';
   fees: number;
   features?: string;
 }
