@@ -2,26 +2,23 @@ import type { FeatureSnapshot } from '../types/feature.ts';
 
 export class Scorer {
   private weights = {
-    activityScore: 0.25,
-    buyRatio: 0.30,
-    timeSinceLaunch: 0.15,
-    liquidity: 0.20,
-    walletCount: 0.10,
+    activityScore: 0.40,
+    walletScore: 0.25,
+    liquidityScore: 0.20,
+    signalAgeScore: 0.15,
   };
 
   score(snapshot: FeatureSnapshot): number {
     const a = this.normalize(snapshot.activityScore, 0, 1);
-    const b = this.normalizeBuyRatio(snapshot.buyRatio);
-    const t = this.decayTime(snapshot.timeSinceLaunchMs);
-    const l = this.normalize(Math.log10(snapshot.liquidity + 1), 0, 6);
-    const w = this.normalize(snapshot.walletCount, 0, 1000);
+    const w = this.walletScore(snapshot.walletCount);
+    const l = this.liquidityScore(snapshot.liquidity);
+    const s = this.signalAgeScore(snapshot.timeSinceLaunchMs);
 
     return (
       a * this.weights.activityScore +
-      b * this.weights.buyRatio +
-      t * this.weights.timeSinceLaunch +
-      l * this.weights.liquidity +
-      w * this.weights.walletCount
+      w * this.weights.walletScore +
+      l * this.weights.liquidityScore +
+      s * this.weights.signalAgeScore
     ) * 100;
   }
 
@@ -30,14 +27,26 @@ export class Scorer {
     return Math.max(0, Math.min(1, (value - min) / (max - min)));
   }
 
-  private normalizeBuyRatio(ratio: number): number {
-    if (ratio < 0.3) return 0;
-    if (ratio > 1) return 1;
-    return (ratio - 0.3) / 0.7;
+  private walletScore(wallets: number): number {
+    if (wallets <= 0) return 0;
+    if (wallets < 50) return wallets / 50;
+    if (wallets <= 300) return 1;
+    if (wallets <= 800) return 1 - (wallets - 300) / 500;
+    if (wallets <= 2000) return 0.1;
+    return 0;
   }
 
-  private decayTime(ms: number): number {
+  private liquidityScore(liquidity: number): number {
+    if (liquidity < 10) return liquidity / 10;
+    if (liquidity <= 500) return 1;
+    if (liquidity <= 2000) return 1 - (liquidity - 500) / 1500;
+    return 0;
+  }
+
+  private signalAgeScore(ms: number): number {
     if (ms < 0) return 0;
-    return Math.exp(-ms / 60_000);
+    if (ms < 10_000) return 1;
+    if (ms <= 60_000) return 1 - (ms - 10_000) / 50_000;
+    return 0;
   }
 }

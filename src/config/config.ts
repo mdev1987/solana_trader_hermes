@@ -1,8 +1,11 @@
 import type { StrategyConfig } from '../types/strategy.ts';
 
 export const DEFAULTS: StrategyConfig = {
-  minScore: 55,
+  minScore: 50,
   minLiquidity: 10,
+  maxLiquidity: 2000,
+  maxSignalAgeMs: 120_000,
+  maxWallets: 2000,
   minActivityScore: 0,
   maxHolders: 100_000,
   minSmartWallets: 0,

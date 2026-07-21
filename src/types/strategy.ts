@@ -3,6 +3,9 @@ export type Decision = 'BUY' | 'SKIP';
 export interface StrategyConfig {
   minScore: number;
   minLiquidity: number;
+  maxLiquidity: number;
+  maxSignalAgeMs: number;
+  maxWallets: number;
   minActivityScore: number;
   maxHolders: number;
   minSmartWallets: number;
