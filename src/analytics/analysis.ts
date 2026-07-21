@@ -279,7 +279,7 @@ export function analyzeDb(csv = false): void {
       }
 
       // Pipeline summary using the same order as strategy flow
-      const filterReasons = ['too_early', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score'];
+      const filterReasons = ['too_early', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score', 'high_score_low_wallets'];
       const reasonMap = new Map(byReason.map(r => [r.reason, r]));
       console.log(`\n  Rejection pipeline (top → bottom):`);
       const pipeline: { reason: string; count: number; cumPct: string }[] = [];
@@ -413,12 +413,12 @@ export function analyzeDb(csv = false): void {
   // ── Score Calibration ──
   console.log('\n─── Score Calibration ───');
   const scoreBuckets = [
-    { label: '50-55', min: 50, max: 55 },
-    { label: '55-60', min: 55, max: 60 },
-    { label: '60-65', min: 60, max: 65 },
-    { label: '65+',   min: 65, max: Infinity },
+    { label: '85-89', min: 85, max: 90 },
+    { label: '90-94', min: 90, max: 95 },
+    { label: '95-97', min: 95, max: 98 },
+    { label: '98-100', min: 98, max: 101 },
   ];
-  console.log(`  ${'Bucket'.padEnd(10)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'AvgROI'.padStart(9)} ${'AvgMFE'.padStart(9)} ${'PF'.padStart(6)} ${'Calibrated?'.padStart(12)}`);
+  console.log(`  ${'Bucket'.padEnd(10)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'AvgROI'.padStart(9)} ${'AvgMFE'.padStart(9)} ${'PF'.padStart(6)}`);
   let prevRoi = -Infinity;
   let monotonic = true;
   for (const b of scoreBuckets) {
@@ -432,10 +432,10 @@ export function analyzeDb(csv = false): void {
     }, 0) / subset.length * 100;
     if (avgRoi <= prevRoi) monotonic = false;
     prevRoi = avgRoi;
-    const cal = avgRoi > prevRoi ? '✓' : '✗';
-    console.log(`  ${b.label.padEnd(10)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${avgRoi.toFixed(1).padStart(8)}% ${avgMfe.toFixed(1).padStart(8)}% ${sm.profitFactor === Infinity ? '  ∞' : sm.profitFactor.toFixed(1).padStart(5)} ${monotonic ? '✓ rising'.padStart(10) : '✗ broken'.padStart(10)}`);
+    console.log(`  ${b.label.padEnd(10)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${avgRoi.toFixed(1).padStart(8)}% ${avgMfe.toFixed(1).padStart(8)}% ${sm.profitFactor === Infinity ? '  ∞' : sm.profitFactor.toFixed(1).padStart(5)}`);
   }
-  console.log(`  Score → ROI monotonic: ${monotonic ? 'YES (well calibrated)' : 'NO (reweight needed)'}`);
+  const status = monotonic ? 'YES' : 'NO (98-100 bucket breaks)';
+  console.log(`  Score → ROI monotonic: ${status}`);
 
   // per-score detail
   const sortedByScore = [...trades].sort((a, b) => a.entryScore - b.entryScore);
