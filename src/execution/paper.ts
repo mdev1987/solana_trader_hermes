@@ -7,6 +7,7 @@ let tradeCounter = 0;
 export class PaperExecutor {
   private balance: number;
   private solAmount: number;
+  private slippage: number;
   private positionManager: PositionManager;
   private trades: TradeResult[] = [];
   private positions: Map<string, OpenPosition> = new Map();
@@ -14,6 +15,7 @@ export class PaperExecutor {
   constructor(config: StrategyConfig, initialBalance: number, solAmount: number) {
     this.balance = initialBalance;
     this.solAmount = solAmount;
+    this.slippage = config.slippagePercent / 100;
     this.positionManager = new PositionManager(config);
   }
 
@@ -29,24 +31,29 @@ export class PaperExecutor {
     return this.trades;
   }
 
-  buy(mint: string, price: number, timestamp: number): OpenPosition | null {
+  buy(mint: string, price: number, timestamp: number, entryDelayMs = 0, signalAgeMs = 0, decisionPrice = 0, entryScore = 0): OpenPosition | null {
     const cost = this.solAmount;
-    if (cost > this.balance || price <= 0) return null;
+    const entryPrice = price * (1 + this.slippage);
+    if (cost > this.balance || entryPrice <= 0) return null;
 
     this.balance -= cost;
     tradeCounter++;
 
-    const quantity = cost / price;
+    const quantity = cost / entryPrice;
 
     const position: OpenPosition = {
       id: `trade_${tradeCounter}`,
       mint,
-      entryPrice: price,
+      entryPrice,
       quantity,
       entryTime: timestamp,
-      highestPrice: price,
-      stopLoss: this.positionManager.calcStopLoss(price),
-      takeProfit: this.positionManager.calcTakeProfit(price),
+      highestPrice: entryPrice,
+      entryDelayMs,
+      signalAgeMs,
+      decisionPrice,
+      entryScore,
+      stopLoss: this.positionManager.calcStopLoss(entryPrice),
+      takeProfit: this.positionManager.calcTakeProfit(entryPrice),
       trailingStopDistance: 0,
       trailingStopActivated: false,
       ttl: timestamp + this.positionManager.ttlMs,
@@ -60,22 +67,28 @@ export class PaperExecutor {
     const position = this.positions.get(mint);
     if (!position) return null;
 
+    const exitPrice = price * (1 - this.slippage);
     this.positions.delete(mint);
-    const proceeds = position.quantity * price;
+    const proceeds = position.quantity * exitPrice;
     this.balance += proceeds;
 
     const pnl = proceeds - (position.quantity * position.entryPrice);
-    const pnlPercent = (price - position.entryPrice) / position.entryPrice;
+    const pnlPercent = (exitPrice - position.entryPrice) / position.entryPrice;
     const fees = (proceeds + position.quantity * position.entryPrice) * 0.001;
 
     const trade: TradeResult = {
       id: position.id,
       mint,
       entryPrice: position.entryPrice,
-      exitPrice: price,
+      exitPrice,
+      maxPrice: position.highestPrice,
       quantity: position.quantity,
       entryTime: position.entryTime,
       exitTime: timestamp,
+      entryDelayMs: position.entryDelayMs,
+      signalAgeMs: position.signalAgeMs,
+      decisionPrice: position.decisionPrice,
+      entryScore: position.entryScore,
       pnl: pnl - fees,
       pnlPercent,
       exitReason,
@@ -84,6 +97,12 @@ export class PaperExecutor {
 
     this.trades.push(trade);
     return trade;
+  }
+
+  setLastTradeFeatures(features: string): void {
+    if (this.trades.length > 0) {
+      this.trades[this.trades.length - 1]!.features = features;
+    }
   }
 
   checkPositions(currentPriceMap: Map<string, number>, timestamp: number): TradeResult[] {

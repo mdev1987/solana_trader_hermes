@@ -9,6 +9,7 @@
     "heatmap": "bun run src/main.ts heatmap",
     "optimize": "bun run src/main.ts optimize",
     "report": "bun run src/main.ts report",
+    "analysis": "bun run src/main.ts analysis",
     "bot": "bun run src/main.ts bot",
     "typecheck": "bunx tsc --noEmit"
   },

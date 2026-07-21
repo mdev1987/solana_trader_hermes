@@ -11,6 +11,8 @@ export interface StrategyConfig {
   trailingStopActivatePercent: number;
   trailingStopDistance: number;
   positionTtlMs: number;
+  executionDelayMs: number;
+  slippagePercent: number;
 }
 
 export interface ScoredToken {

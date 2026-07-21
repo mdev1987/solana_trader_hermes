@@ -1,5 +1,11 @@
 import type { TradeResult } from '../types/trade.ts';
 
+export interface OutlierReport {
+  label: string;
+  removed: number;
+  metrics: TradeMetrics;
+}
+
 export interface TradeMetrics {
   totalTrades: number;
   winningTrades: number;
@@ -88,4 +94,19 @@ export function calculateMetrics(trades: TradeResult[]): TradeMetrics {
     bestTrade: best,
     worstTrade: worst,
   };
+}
+
+export function outlierReports(trades: TradeResult[]): OutlierReport[] {
+  if (trades.length < 3) return [];
+
+  const sorted = [...trades].sort((a, b) => Math.abs(b.pnl) - Math.abs(a.pnl));
+
+  const top1 = sorted.slice(1);
+  const top5pct = sorted.slice(Math.max(1, Math.ceil(trades.length * 0.05)));
+
+  return [
+    { label: 'All trades', removed: 0, metrics: calculateMetrics(trades) },
+    { label: 'Excl. top 1', removed: trades.length - top1.length, metrics: calculateMetrics(top1) },
+    { label: 'Excl. top 5%', removed: trades.length - top5pct.length, metrics: calculateMetrics(top5pct) },
+  ];
 }

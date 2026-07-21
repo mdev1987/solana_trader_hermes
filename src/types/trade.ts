@@ -3,13 +3,19 @@ export interface TradeResult {
   mint: string;
   entryPrice: number;
   exitPrice: number;
+  maxPrice: number;
   quantity: number;
   entryTime: number;
   exitTime: number;
+  entryDelayMs: number;
+  signalAgeMs: number;
+  decisionPrice: number;
+  entryScore: number;
   pnl: number;
   pnlPercent: number;
   exitReason: 'tp' | 'sl' | 'trailing' | 'ttl' | 'manual';
   fees: number;
+  features?: string;
 }
 
 export interface OpenPosition {
@@ -19,6 +25,10 @@ export interface OpenPosition {
   quantity: number;
   entryTime: number;
   highestPrice: number;
+  entryDelayMs: number;
+  signalAgeMs: number;
+  decisionPrice: number;
+  entryScore: number;
   stopLoss: number;
   takeProfit: number;
   trailingStopDistance: number;

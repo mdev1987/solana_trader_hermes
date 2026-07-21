@@ -8,8 +8,9 @@ import { ExecutionRouter } from './execution/router.ts';
 import { TradeRepository } from './storage/trade_repository.ts';
 import { FeatureRepository } from './storage/feature_repository.ts';
 
-import { calculateMetrics } from './analytics/metrics.ts';
-import { printReport } from './analytics/report.ts';
+import { calculateMetrics, outlierReports } from './analytics/metrics.ts';
+import { printReport, printOutlierReports } from './analytics/report.ts';
+import { analyzeDb } from './analytics/analysis.ts';
 import { Optimizer } from './analytics/optimizer.ts';
 import { createConfig } from './config/config.ts';
 import { ENV } from './config/env.ts';
@@ -17,6 +18,19 @@ import { fetchRankings } from './api/rank_api.ts';
 import { fetchHeatmap } from './api/heatmap_api.ts';
 import type { ReplayEvent } from './types/replay.ts';
 import type { FeatureSnapshot } from './types/feature.ts';
+
+interface PendingBuy {
+  mint: string;
+  snapshot: FeatureSnapshot;
+  score: number;
+  executeAt: number;
+  expiresAt: number;
+  decisionPrice: number;
+}
+
+const PENDING_BUY_TIMEOUT_MS = 10_000;
+const FILL_WINDOW_MS = 500;
+const DECISION_DELAY_MS = 2000;
 
 export async function main() {
   const args = process.argv.slice(2);
@@ -40,6 +54,9 @@ export async function main() {
     case 'report':
       await runReport();
       break;
+    case 'analysis':
+      await runAnalysis();
+      break;
     case 'bot':
       await runBot();
       break;
@@ -50,6 +67,7 @@ export async function main() {
       console.log('  heatmap  - Fetch and display heatmap data');
       console.log('  optimize - Run grid search optimization');
       console.log('  report   - Show trade report from database');
+      console.log('  analysis - Show detailed DB trade analysis');
       console.log('  bot      - Start Telegram bot');
   }
 }
@@ -67,12 +85,77 @@ async function runReplay(args: string[]): Promise<void> {
   const executor = new PaperExecutor(config, ENV.PAPER_BALANCE, ENV.PAPER_SOL_AMOUNT);
   const router = new ExecutionRouter(executor);
   const tradeRepo = new TradeRepository();
+
   const COOLDOWN_MS = 300_000;
   const MAX_POSITIONS = 5;
   const MIN_PRICE = 1e-10;
+  const DELAY_MS = config.executionDelayMs;
+
   const recentlySold = new Map<string, number>();
   const featureRepo = new FeatureRepository();
   const snapshotCache = new Map<string, FeatureSnapshot>();
+  const lastPrices = new Map<string, number>();
+  const pendingBuys: PendingBuy[] = [];
+
+  const tryFillPendingBuy = (event: ReplayEvent, price: number): boolean => {
+    let filled = false;
+    let i = 0;
+    while (i < pendingBuys.length) {
+      const pb = pendingBuys[i]!;
+      if (pb.mint !== event.mint) { i++; continue; }
+      if (event.timestamp < pb.executeAt) { i++; continue; }
+
+      const windowEnd = pb.executeAt + FILL_WINDOW_MS;
+      if (event.timestamp >= windowEnd) {
+        pendingBuys.splice(i, 1);
+        console.log(`[CANCEL] ${pb.mint} score=${pb.score.toFixed(1)} reason=fill_window_exceeded`);
+        continue;
+      }
+
+      pendingBuys.splice(i, 1);
+
+      const soldAt = recentlySold.get(pb.mint);
+      if (soldAt && event.timestamp - soldAt < COOLDOWN_MS) continue;
+      if (router.getPaper().getPositions().has(pb.mint)) continue;
+      if (router.getPaper().getPositions().size >= MAX_POSITIONS) continue;
+      if (price <= 0) continue;
+
+      const entryDelayMs = event.timestamp - (pb.executeAt - DELAY_MS);
+      const signalAgeMs = pb.snapshot.timeSinceLaunchMs;
+      const pos = router.execute('BUY', pb.snapshot, price, entryDelayMs, signalAgeMs, pb.decisionPrice, pb.score);
+      if (pos) {
+        filled = true;
+        const ageSec = (signalAgeMs / 1000).toFixed(1);
+        const br = pb.snapshot.buyRatio.toFixed(2);
+        const features = JSON.stringify({
+          score: pb.score.toFixed(1),
+          activity: pb.snapshot.activityScore.toFixed(3),
+          buyRatio: br,
+          wallets: pb.snapshot.walletCount,
+          liquidity: pb.snapshot.liquidity.toFixed(2),
+          signalAgeSec: ageSec,
+          entryDelayMs,
+          entryPrice: price.toExponential(3),
+          decisionPrice: pb.decisionPrice.toExponential(3),
+          decision: 'BUY',
+        });
+        executor.setLastTradeFeatures(features);
+        console.log(`[BUY] ${pb.mint} score=${pb.score.toFixed(1)} age=${ageSec}s buyR=${br} price=${price.toExponential(3)} delay=${entryDelayMs}ms`);
+      }
+    }
+    return filled;
+  };
+
+  const cleanupExpiredPendingBuys = (now: number): void => {
+    let i = 0;
+    while (i < pendingBuys.length) {
+      if (pendingBuys[i]!.expiresAt <= now) {
+        pendingBuys.splice(i, 1);
+      } else {
+        i++;
+      }
+    }
+  };
 
   player.onEvent((event: ReplayEvent) => {
     if (!event.mint || !event.mint.endsWith('pump')) return;
@@ -80,38 +163,67 @@ async function runReplay(args: string[]): Promise<void> {
 
     const tokenAmount = event.tokenAmount ?? event.initialBuy ?? 0;
     const price = event.quoteAmount && tokenAmount ? event.quoteAmount / tokenAmount : 0;
-    if (price < MIN_PRICE) return;
+
+    lastPrices.set(event.mint, price);
+    tryFillPendingBuy(event, price);
+    cleanupExpiredPendingBuys(event.timestamp);
+
+    if (price <= 0) return;
 
     const snapshot = featureBuilder.fromReplayEvent(event);
     if (!snapshot) return;
+    if (snapshot.timeSinceLaunchMs < DECISION_DELAY_MS) return;
     featureStore.set(snapshot);
-    snapshotCache.set(event.mint, snapshot);
 
     const { decision, score } = strategy.evaluate(snapshot);
+    snapshotCache.set(event.mint, { ...snapshot, rankScore: score });
     if (decision === 'BUY') {
+      if (price < MIN_PRICE) return;
       const soldAt = recentlySold.get(event.mint);
       if (soldAt && event.timestamp - soldAt < COOLDOWN_MS) return;
-      const positions = router.getPaper().getPositions();
-      if (positions.has(event.mint)) return;
-      if (positions.size >= MAX_POSITIONS) return;
-      const pos = router.execute(decision, snapshot, price);
-      if (pos) {
-        const age = (snapshot.timeSinceLaunchMs / 1000).toFixed(1);
-        const br = snapshot.buyRatio.toFixed(2);
-        console.log(`[BUY] ${event.mint} score=${score.toFixed(1)} age=${age}s buyR=${br} price=${price.toExponential(3)}`);
-      }
+      if (pendingBuys.some(pb => pb.mint === event.mint)) return;
+      if (router.getPaper().getPositions().has(event.mint!)) return;
+      if (router.getPaper().getPositions().size + pendingBuys.length >= MAX_POSITIONS) return;
+
+      pendingBuys.push({
+        mint: event.mint,
+        snapshot,
+        score,
+        executeAt: event.timestamp + DELAY_MS,
+        expiresAt: event.timestamp + DELAY_MS + PENDING_BUY_TIMEOUT_MS,
+        decisionPrice: price,
+      });
+      console.log(`[SIGNAL] ${event.mint} score=${score.toFixed(1)} price=${price.toExponential(3)} delay=${DELAY_MS}ms`);
     }
 
     const priceMap = new Map([[event.mint, price]]);
     const exited = router.updatePositions(priceMap, event.timestamp);
     for (const trade of exited) {
-      console.log(`[SELL] ${trade.mint} pnl=${trade.pnl.toFixed(4)} (${(trade.pnlPercent * 100).toFixed(2)}%) reason=${trade.exitReason}`);
+      const holdSec = ((trade.exitTime - trade.entryTime) / 1000).toFixed(0);
+      const features = JSON.stringify({
+        score: snapshotCache.get(trade.mint)?.rankScore.toFixed(1) ?? '?',
+        activity: snapshot.activityScore.toFixed(3),
+        buyRatio: snapshot.buyRatio.toFixed(2),
+        wallets: snapshot.walletCount,
+        liquidity: snapshot.liquidity.toFixed(2),
+        holdSec,
+        entryPrice: trade.entryPrice.toExponential(3),
+        exitPrice: trade.exitPrice.toExponential(3),
+        maxPrice: trade.maxPrice.toExponential(3),
+        decisionPrice: trade.decisionPrice.toExponential(3),
+        entryDelayMs: trade.entryDelayMs,
+        roi: (trade.pnlPercent * 100).toFixed(2),
+        decision: 'SELL',
+        result: trade.pnl > 0 ? 'WIN' : 'LOSS',
+        exitReason: trade.exitReason,
+      });
+      trade.features = features;
+      console.log(`[SELL] ${trade.mint} pnl=${trade.pnl.toFixed(4)} (${(trade.pnlPercent * 100).toFixed(2)}%) reason=${trade.exitReason} hold=${holdSec}s`);
       recentlySold.set(trade.mint, event.timestamp);
       tradeRepo.save(trade);
       featureRepo.save(snapshot);
     }
 
-    snapshotCache.set(event.mint, { ...snapshot, rankScore: score });
   });
 
   let count = 0;
@@ -143,6 +255,8 @@ async function runReplay(args: string[]): Promise<void> {
   if (trades.length > 0) {
     const metrics = calculateMetrics(trades);
     printReport(metrics);
+    const reports = outlierReports(trades);
+    if (reports.length > 0) printOutlierReports(reports);
   }
 }
 
@@ -188,6 +302,10 @@ async function runOptimize(): Promise<void> {
     const r = results[i]!;
     console.log(`  #${i + 1} score>=${r.config.minScore} liq>=${r.config.minLiquidity} act>=${r.config.minActivityScore} wallets>=${r.config.minSmartWallets} → PnL=$${r.totalPnl.toFixed(2)}`);
   }
+}
+
+async function runAnalysis(): Promise<void> {
+  analyzeDb();
 }
 
 async function runReport(): Promise<void> {

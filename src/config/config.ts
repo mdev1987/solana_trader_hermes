@@ -11,6 +11,8 @@ export const DEFAULTS: StrategyConfig = {
   trailingStopActivatePercent: 0.25,
   trailingStopDistance: 0.12,
   positionTtlMs: 24 * 60 * 60 * 1000,
+  executionDelayMs: 800,
+  slippagePercent: 0.5,
 };
 
 export function createConfig(overrides: Partial<StrategyConfig> = {}): StrategyConfig {

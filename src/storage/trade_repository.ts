@@ -5,20 +5,26 @@ export class TradeRepository {
   save(trade: TradeResult): void {
     const db = getDb();
     db.run(
-      `INSERT OR REPLACE INTO trades (id, mint, entry_price, exit_price, quantity, entry_time, exit_time, pnl, pnl_percent, exit_reason, fees)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO trades (id, mint, entry_price, exit_price, max_price, quantity, entry_time, exit_time, entry_delay_ms, signal_age_ms, decision_price, entry_score, pnl, pnl_percent, exit_reason, fees, features)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         trade.id,
         trade.mint,
         trade.entryPrice,
         trade.exitPrice,
+        trade.maxPrice,
         trade.quantity,
         trade.entryTime,
         trade.exitTime,
+        trade.entryDelayMs,
+        trade.signalAgeMs,
+        trade.decisionPrice,
+        trade.entryScore,
         trade.pnl,
         trade.pnlPercent,
         trade.exitReason,
         trade.fees,
+        trade.features ?? null,
       ],
     );
   }
@@ -65,13 +71,19 @@ export class TradeRepository {
       mint: row.mint as string,
       entryPrice: row.entry_price as number,
       exitPrice: row.exit_price as number,
+      maxPrice: (row.max_price as number) ?? 0,
       quantity: row.quantity as number,
       entryTime: row.entry_time as number,
       exitTime: row.exit_time as number,
+      entryDelayMs: (row.entry_delay_ms as number) ?? 0,
+      signalAgeMs: (row.signal_age_ms as number) ?? 0,
+      decisionPrice: (row.decision_price as number) ?? 0,
+      entryScore: (row.entry_score as number) ?? 0,
       pnl: row.pnl as number,
       pnlPercent: row.pnl_percent as number,
       exitReason: row.exit_reason as TradeResult['exitReason'],
       fees: row.fees as number,
+      features: row.features as string | undefined,
     };
   }
 }
