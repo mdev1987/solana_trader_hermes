@@ -305,7 +305,8 @@ async function runOptimize(): Promise<void> {
 }
 
 async function runAnalysis(): Promise<void> {
-  analyzeDb();
+  const csv = process.argv.includes('--csv');
+  analyzeDb(csv);
 }
 
 async function runReport(): Promise<void> {

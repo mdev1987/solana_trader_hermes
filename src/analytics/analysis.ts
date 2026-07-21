@@ -37,7 +37,7 @@ function fmtHold(ms: number): string {
 
 const SEP = '  ';
 
-export function analyzeDb(): void {
+export function analyzeDb(csv = false): void {
   initDb();
   const repo = new TradeRepository();
   const trades = repo.getAll();
@@ -232,6 +232,111 @@ export function analyzeDb(): void {
     console.log(`  ${b.label.padEnd(10)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor === Infinity ? '    ∞' : sm.profitFactor.toFixed(1).padStart(6)} ${avgMfe.toFixed(1).padStart(8)}%`);
   }
 
+  // ── Score Component Breakdown ──
+  console.log('\n─── Score Component Breakdown ───');
+  interface Components { activityScore: number; buyRatio: number; timeDecay: number; liquidity: number; walletCount: number; total: number; entryScore: number; }
+  const computeComponents = (t: TradeResult): Components => {
+    const f = parseFeatures(t);
+    const activityScore = Number(f.activity) || 0;
+    const buyRatio = Number(f.buyRatio) || 0;
+    const walletCount = Number(f.wallets) || 0;
+    const liquidity = Number(f.liquidity) || 0;
+    const timeMs = t.signalAgeMs;
+
+    const norm = (v: number, min: number, max: number) => max > min ? Math.max(0, Math.min(1, (v - min) / (max - min))) : 0;
+    const normBuy = (r: number) => r < 0.3 ? 0 : Math.min(1, (r - 0.3) / 0.7);
+    const decayTime = (ms: number) => ms < 0 ? 0 : Math.exp(-ms / 60_000);
+
+    const raw = {
+      activityScore: norm(activityScore, 0, 1),
+      buyRatio: normBuy(buyRatio),
+      timeDecay: decayTime(timeMs),
+      liquidity: norm(Math.log10(liquidity + 1), 0, 6),
+      walletCount: norm(walletCount, 0, 1000),
+    };
+    const weights = { activityScore: 0.20, buyRatio: 0.25, timeDecay: 0.25, liquidity: 0.15, walletCount: 0.15 };
+    const weighted: Components = { ...raw, total: 0, entryScore: t.entryScore };
+    weighted.total = 0;
+    for (const k of Object.keys(raw) as (keyof typeof raw)[]) {
+      const v = weighted[k];
+      weighted[k] = v * weights[k] * 100;
+      weighted.total += weighted[k];
+    }
+    return weighted;
+  };
+
+  const compKeys: (keyof Components)[] = ['activityScore', 'buyRatio', 'timeDecay', 'liquidity', 'walletCount'];
+  if (winners.length > 0 && losers.length > 0) {
+    const compRows: { name: string; winAvg: number; loseAvg: number; dir: string }[] = [];
+    const wComps = winners.map(computeComponents);
+    const lComps = losers.map(computeComponents);
+    for (const key of compKeys) {
+      const wAvg = wComps.reduce((s, c) => s + c[key], 0) / wComps.length;
+      const lAvg = lComps.reduce((s, c) => s + c[key], 0) / lComps.length;
+      const delta = wAvg - lAvg;
+      let dir = '—';
+      if (Math.abs(delta) > 0.01) dir = delta > 0 ? 'Higher → Better' : 'Lower → Better';
+      compRows.push({ name: key, winAvg: wAvg, loseAvg: lAvg, dir });
+    }
+    const wTotal = wComps.reduce((s, c) => s + c.total, 0) / wComps.length;
+    const lTotal = lComps.reduce((s, c) => s + c.total, 0) / lComps.length;
+    console.log(`  ${'Component'.padEnd(16)} ${'Winner Avg'.padStart(10)} ${'Loser Avg'.padStart(10)} ${'Δ'.padStart(10)} Direction`);
+    for (const r of compRows) {
+      console.log(`  ${r.name.padEnd(16)} ${r.winAvg.toFixed(2).padStart(10)} ${r.loseAvg.toFixed(2).padStart(10)} ${(r.winAvg - r.loseAvg).toFixed(2).padStart(10)} ${r.dir}`);
+    }
+    console.log(`  ${'Total (weighted)'.padEnd(16)} ${wTotal.toFixed(2).padStart(10)} ${lTotal.toFixed(2).padStart(10)} ${(wTotal - lTotal).toFixed(2).padStart(10)}`);
+  } else {
+    console.log('  (need both winners and losers)');
+  }
+
+  // ── Failure Reasons ──
+  console.log('\n─── Failure Reasons ───');
+  const failures: Record<string, number> = {};
+  for (const t of trades) {
+    if (t.pnl > 0) continue;
+    const gapPct = Math.abs(t.pnlPercent) - 0.30;
+    if (t.maxPrice <= t.entryPrice) {
+      failures['Never profitable'] = (failures['Never profitable'] ?? 0) + 1;
+    } else if (gapPct > 0.10) {
+      failures['Gap through stop (>10% below SL)'] = (failures['Gap through stop (>10% below SL)'] ?? 0) + 1;
+    } else if (t.exitReason === 'trailing') {
+      failures['Trailing reversal'] = (failures['Trailing reversal'] ?? 0) + 1;
+    } else if (t.exitReason === 'ttl') {
+      failures['Max hold time'] = (failures['Max hold time'] ?? 0) + 1;
+    } else {
+      failures['Hit SL (normal)'] = (failures['Hit SL (normal)'] ?? 0) + 1;
+    }
+  }
+  const nLosses = losers.length;
+  for (const [reason, count] of Object.entries(failures)) {
+    const pct = (count / nLosses * 100).toFixed(0);
+    console.log(`  ${reason.padEnd(36)} ${count.toString().padStart(3)}/${nLosses} (${pct}%)`);
+  }
+
+  // ── Liquidity Buckets ──
+  console.log('\n─── Liquidity Buckets ───');
+  const liqBuckets = [
+    { label: '<10',       min: 0, max: 10 },
+    { label: '10-100',    min: 10, max: 100 },
+    { label: '100-500',   min: 100, max: 500 },
+    { label: '500+',      min: 500, max: Infinity },
+  ];
+  console.log(`  ${'Liquidity'.padEnd(14)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'PnL'.padStart(12)} ${'PF'.padStart(6)} ${'AvgMFE'.padStart(9)}`);
+  for (const b of liqBuckets) {
+    const subset = trades.filter(t => {
+      const f = parseFeatures(t);
+      const liq = Number(f.liquidity) || 0;
+      return liq >= b.min && liq < b.max;
+    });
+    if (subset.length === 0) continue;
+    const sm = calculateMetrics(subset);
+    const avgMfe = subset.reduce((s, t) => {
+      const mfe = t.maxPrice > 0 ? (t.maxPrice - t.entryPrice) / t.entryPrice : 0;
+      return s + mfe;
+    }, 0) / subset.length * 100;
+    console.log(`  ${b.label.padEnd(14)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor === Infinity ? '    ∞' : sm.profitFactor.toFixed(1).padStart(6)} ${avgMfe.toFixed(1).padStart(8)}%`);
+  }
+
   // ── Entry Delay Buckets ──
   console.log('\n─── Entry Delay Buckets ───');
   const delayBuckets = [
@@ -297,4 +402,14 @@ export function analyzeDb(): void {
   }
 
   console.log('\n═══════════════════════════════════════════════════════════════\n');
+
+  if (csv) {
+    console.log('CSV:');
+    const csvHdr = ['id','mint','entryPrice','exitPrice','maxPrice','entryDelayMs','signalAgeMs','holdSec','pnl','pnlPercent','entryScore','exitReason','decisionPrice'];
+    console.log(csvHdr.join(','));
+    for (const t of trades) {
+      const hold = ((t.exitTime - t.entryTime) / 1000).toFixed(0);
+      console.log([t.id, t.mint, t.entryPrice, t.exitPrice, t.maxPrice, t.entryDelayMs, t.signalAgeMs, hold, t.pnl.toFixed(6), (t.pnlPercent*100).toFixed(2), t.entryScore, t.exitReason, t.decisionPrice].join(','));
+    }
+  }
 }
