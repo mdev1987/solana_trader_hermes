@@ -232,31 +232,32 @@ def shap_analysis(model_result: dict) -> dict | None:
 def simulate_trade_exit(row: dict, params: dict) -> float:
     """
     Simulate exit for a single trade given params.
-    Order matches live engine: SL/TP caps → break-even → trailing stop.
-    Returns the realized pnl_percent.
+    Order matches live engine: SL (floor) → break-even (floor) → trailing (floor) → TP (ceiling).
     """
-    pnl_pct = row['pnl_pct_actual']
+    pnl = row['pnl_pct_actual']
     mfe = row['mfe']
+
     sl = abs(params['stop_loss'])
     tp = params['take_profit']
     be = params['break_even']
     trail_act = params.get('trail_activate', 0.25)
     trail_dist = params.get('trail_distance', 0.12)
 
-    if pnl_pct < -sl:
-        pnl_pct = -sl
-    if pnl_pct > tp:
-        pnl_pct = tp
+    # hard stop first
+    pnl = max(pnl, -sl)
 
-    if mfe >= be and pnl_pct < 0:
-        pnl_pct = 0.0
+    # break-even: if price reached activate%, floor at 0
+    if mfe >= be:
+        pnl = max(pnl, 0.0)
 
+    # trailing: if price reached trail_activate%, floor at trail exit price
     if mfe >= trail_act:
-        trail_price = (1 + mfe) * (1 - trail_dist) - 1
-        if trail_price > pnl_pct:
-            pnl_pct = trail_price
+        trail_exit = (1 + mfe) * (1 - trail_dist) - 1
+        pnl = max(pnl, trail_exit)
 
-    return pnl_pct
+    # TP cap last — trailing cannot beat this
+    pnl = min(pnl, tp)
+    return pnl
 
 
 def filtered_pnl_percents(params: dict, raw: list) -> list:
@@ -379,8 +380,8 @@ def _df_to_raw(df_slice):
     """Convert a DataFrame slice to the raw list format."""
     raw = []
     for _, row in df_slice.iterrows():
-        entry_px = row.get('entry_price', 1) or 1
-        qty = row.get('quantity', 1) or 1
+        entry_px = row.get('entry_price') or 0
+        qty = row.get('quantity') or 0
         raw.append({
             'wallet': row.get('feat_wallets', 0),
             'liq': row.get('feat_liquidity', 0),
