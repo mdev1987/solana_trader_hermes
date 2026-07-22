@@ -108,8 +108,9 @@ def run(hours: int = 2, n_trials: int = 200):
     df = load_trades_from_csv(paths['trades'])
     opt_result = optuna_optimize(df, n_trials=n_trials)
     if opt_result:
-        print(f"  Train PF (in-sample, {opt_result['n_folds']}-fold avg): {opt_result['train_pf']:.2f} ({opt_result['n_train']} trades)")
-        print(f"  Test PF (out-of-sample, {opt_result['n_folds']}-fold avg): {opt_result['test_pf']:.2f} ({opt_result['n_test']} trades)")
+        print(f"  Train PF ({opt_result['n_folds']}-fold avg): {opt_result['train_pf']:.2f}")
+        print(f"  Test PF (pooled across folds): {opt_result['test_pf']:.2f} ({opt_result['pooled_test_trades']} test trades)")
+        print(f"  Fold sizes (train_end, test_end, raw, selected): {opt_result['fold_sizes']}")
         print(f"\n  Best normalized weights:")
         bn = opt_result['best_weights_norm']
         print(f"    wallet={bn['wallet']:.3f}  age={bn['age']:.3f}  liq={bn['liq']:.3f}")

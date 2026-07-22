@@ -139,6 +139,7 @@ def bucket_analysis(df: pd.DataFrame) -> dict:
 def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame | None:
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import cross_val_score
 
     avail = avail_features(df)
     avail = [c for c in avail if c in df.columns and df[c].notna().sum() > 5]
@@ -159,7 +160,7 @@ def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame
 # ── XGBoost PnL Regressor ────────────────────────────────────────────────────
 
 def xgboost_regression(df: pd.DataFrame) -> dict | None:
-    from sklearn.model_selection import cross_val_score, train_test_split
+    from sklearn.model_selection import TimeSeriesSplit
     from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
     import xgboost as xgb
 
@@ -167,12 +168,16 @@ def xgboost_regression(df: pd.DataFrame) -> dict | None:
     if len(avail) < 2:
         return None
 
-    X = df[avail].fillna(0).values
-    y = df['pnl'].values
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    X = df_sorted[avail].fillna(0).values
+    y = df_sorted['pnl'].values
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42
-    )
+    split = int(len(df_sorted) * 0.7)
+    if split < 5 or len(df_sorted) - split < 3:
+        split = max(len(df_sorted) - 3, 3)
+
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
 
     model = xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.1,
@@ -181,9 +186,18 @@ def xgboost_regression(df: pd.DataFrame) -> dict | None:
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
     y_pred = model.predict(X_test)
-    cv_scores = cross_val_score(model, X, y, cv=min(5, len(df) // 3), scoring='neg_mean_absolute_error')
 
-    # Direction accuracy: does sign(predicted) == sign(actual)?
+    tscv = TimeSeriesSplit(n_splits=min(3, len(df_sorted) // 5))
+    cv_scores = []
+    for train_idx, val_idx in tscv.split(X):
+        m = xgb.XGBRegressor(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=42, objective='reg:squarederror',
+        )
+        m.fit(X[train_idx], y[train_idx], verbose=False)
+        y_cv = m.predict(X[val_idx])
+        cv_scores.append(-mean_absolute_error(y[val_idx], y_cv))
+
     dir_acc = (np.sign(y_pred) == np.sign(y_test)).mean()
 
     imp = pd.DataFrame({
@@ -197,8 +211,8 @@ def xgboost_regression(df: pd.DataFrame) -> dict | None:
         'mae': mean_absolute_error(y_test, y_pred),
         'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
         'direction_accuracy': dir_acc,
-        'cv_mae_mean': -cv_scores.mean(),
-        'cv_mae_std': cv_scores.std(),
+        'cv_mae_mean': -np.mean(cv_scores) if cv_scores else 0,
+        'cv_mae_std': np.std(cv_scores) if cv_scores else 0,
         'feature_importance': imp,
         'X_train': X_train, 'X_test': X_test,
         'y_train': y_train, 'y_test': y_test,
@@ -214,9 +228,10 @@ def shap_analysis(model_result: dict) -> dict | None:
     except ImportError:
         return None
     model = model_result['model']
+    X_train = model_result['X_train']
     X_test = model_result['X_test']
     names = model_result['feature_names']
-    explainer = shap.Explainer(model, X_test)
+    explainer = shap.Explainer(model, X_train)
     shap_values = explainer(X_test)
     mean_shap = np.abs(shap_values.values).mean(axis=0)
     return {
@@ -317,18 +332,16 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     if n < 20:
         return None
 
-    folds = [0.40, 0.55, 0.70, 0.85]
+    fold_ends = [int(n * f) for f in [0.40, 0.55, 0.70, 0.85]]
     fold_splits = []
-    for f in folds:
-        train_end = int(n * f)
-        test_end = int(n * min(f + 0.15, 1.0))
-        if train_end >= test_end or train_end < 5 or test_end - train_end < 3:
+    for fe in fold_ends:
+        te = int(n * min(n / fold_ends[-1] if fe == fold_ends[-1] else (fe / n + 0.15), 1.0))
+        if fe >= te or fe < 5 or te - fe < 3:
             continue
-        fold_splits.append((train_end, test_end))
+        fold_splits.append((fe, te))
 
     if not fold_splits:
-        train_end, test_end = int(n * 0.6), n
-        fold_splits = [(train_end, test_end)]
+        fold_splits = [(int(n * 0.6), n)]
 
     train_raw_all = _df_to_raw(df_sorted)
 
@@ -347,13 +360,17 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
     best = study.best_params
     train_pfs = []
-    test_pfs = []
+    all_test_trades: list[dict] = []  # pooled test trades across folds
+    fold_sizes = []
     for te, tte in fold_splits:
-        tr, tev = compute_pf_for_split(best, te, tte)
+        tr, _ = compute_pf_for_split(best, te, tte)
         train_pfs.append(tr)
-        test_pfs.append(tev)
+        test_raw = train_raw_all[te:tte]
+        selected = filtered_pnl_percents(best, test_raw)
+        all_test_trades.extend(selected)
+        fold_sizes.append((te, tte, len(test_raw), len(selected)))
     train_pf = sum(train_pfs) / len(train_pfs)
-    test_pf = sum(test_pfs) / len(test_pfs)
+    test_pf = pf_from_pnl_list(all_test_trades)
 
     tw = best['w_wallet'] + best['w_age'] + best['w_liq']
     best_norm = {
@@ -368,8 +385,8 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         'train_pf': train_pf,
         'test_pf': test_pf,
         'n_folds': len(fold_splits),
-        'n_train': sum(te for te, _ in fold_splits) // len(fold_splits),
-        'n_test': sum(tte - te for te, tte in fold_splits) // len(fold_splits),
+        'fold_sizes': [(tr, te, n_raw, n_sel) for tr, te, n_raw, n_sel in fold_sizes],
+        'pooled_test_trades': len(all_test_trades),
         'trials': n_trials,
         'study': study,
         'n_params': len(best),
