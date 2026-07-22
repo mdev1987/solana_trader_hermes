@@ -1,4 +1,4 @@
-"""Statistical analysis, feature importance, XGBoost, SHAP, Optuna optimization."""
+"""Statistical analysis, PnL regression, SHAP, Optuna full-parameter optimization."""
 
 import pandas as pd
 import numpy as np
@@ -9,7 +9,6 @@ warnings.filterwarnings('ignore')
 
 
 def parse_features(trade_row) -> dict:
-    """Parse the features JSON column from a trade."""
     f = getattr(trade_row, 'features', None) or getattr(trade_row, 'features', '{}')
     if isinstance(f, str):
         try:
@@ -21,302 +20,325 @@ def parse_features(trade_row) -> dict:
 
 def load_trades_from_csv(csv_path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
-    df['pnl_percent'] = pd.to_numeric(df['pnl_percent'], errors='coerce')
-    df['entry_score'] = pd.to_numeric(df['entry_score'], errors='coerce')
-    df['signal_age_ms'] = pd.to_numeric(df['signal_age_ms'], errors='coerce')
-    df['entry_delay_ms'] = pd.to_numeric(df['entry_delay_ms'], errors='coerce')
-    df['entry_price'] = pd.to_numeric(df['entry_price'], errors='coerce')
-    df['exit_price'] = pd.to_numeric(df['exit_price'], errors='coerce')
-    df['max_price'] = pd.to_numeric(df['max_price'], errors='coerce')
-    df['min_price'] = pd.to_numeric(df['min_price'], errors='coerce')
+    numeric = ['pnl', 'pnl_percent', 'entry_score', 'signal_age_ms',
+               'entry_delay_ms', 'entry_price', 'exit_price', 'max_price', 'min_price']
+    for c in numeric:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
 
-    # Parse features JSON into columns
     feat_rows = []
     for _, row in df.iterrows():
-        feat = parse_features(row)
-        feat_rows.append(feat)
+        feat_rows.append(parse_features(row))
     feat_df = pd.DataFrame(feat_rows)
-    for col in feat_df.columns:
-        feat_df[col] = pd.to_numeric(feat_df[col], errors='coerce')
-
+    feat_df = feat_df.apply(pd.to_numeric, errors='coerce')
     df = pd.concat([df, feat_df.add_prefix('feat_')], axis=1)
 
-    # Derived features
     df['is_win'] = (df['pnl'] > 0).astype(int)
     df['mfe'] = (df['max_price'] - df['entry_price']) / df['entry_price']
     df['mae'] = (df['entry_price'] - df['min_price']) / df['entry_price']
     df['hold_sec'] = (df['exit_time'] - df['entry_time']) / 1000
+
+    # ── Engineered features (rate-based, interaction) ──
+    df['r_signal_age_s'] = df['signal_age_ms'] / 1000
+    df['wallet_density'] = df['feat_wallets'] / (df['r_signal_age_s'] + 1)
+    df['liq_per_wallet'] = df['feat_liquidity'] / (df['feat_wallets'] + 1)
+    df['buy_velocity'] = df['feat_buyRatio'] / (df['r_signal_age_s'] + 1)
+    df['activity_accel'] = df['feat_activity'] / (df['r_signal_age_s'] / 60 + 1)
+    df['score_x_wallets'] = df['entry_score'] * df['feat_wallets'] / 100
+    df['wallets_signal_interact'] = df['feat_wallets'] * df['r_signal_age_s'] / 1000
     return df
 
 
 def load_rejected_from_csv(csv_path: str | Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    numeric_cols = ['timestamp', 'score', 'activity_score', 'buy_ratio',
-                    'wallet_count', 'liquidity', 'signal_age_ms', 'price']
-    for c in numeric_cols:
-        if c in df.columns:
+    for c in df.columns:
+        try:
             df[c] = pd.to_numeric(df[c], errors='coerce')
+        except (ValueError, TypeError):
+            pass
     return df
+
+
+def avail_features(df: pd.DataFrame) -> list:
+    cols = ['entry_score', 'signal_age_ms', 'entry_delay_ms',
+            'feat_wallets', 'feat_liquidity', 'feat_buyRatio', 'feat_activity',
+            'wallet_density', 'liq_per_wallet', 'buy_velocity',
+            'activity_accel', 'score_x_wallets', 'wallets_signal_interact']
+    return [c for c in cols if c in df.columns and df[c].notna().sum() > 5]
+
+
+# ── Rolling Metrics ──────────────────────────────────────────────────────────
+
+def rolling_metrics(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    if len(df) < window * 2:
+        return pd.DataFrame()
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    roll = df_sorted.rolling(window, min_periods=window)
+    gross_win = roll['pnl'].apply(lambda x: x[x > 0].sum())
+    gross_loss = roll['pnl'].apply(lambda x: abs(x[x <= 0].sum()))
+    pf = gross_win / gross_loss.replace(0, np.nan)
+    wr = roll['is_win'].mean()
+    cum_pnl = roll['pnl'].sum()
+    rolling_max = cum_pnl.cummax()
+    dd = (cum_pnl - rolling_max) / (rolling_max + 1e-9)
+    return pd.DataFrame({
+        'trade_end': df_sorted['exit_time'],
+        'rolling_pf': pf,
+        'rolling_wr': wr,
+        'rolling_pnl': cum_pnl,
+        'rolling_dd': dd,
+    }).dropna().reset_index(drop=True)
 
 
 # ── Bucket Analysis ──────────────────────────────────────────────────────────
 
 def bucket_analysis(df: pd.DataFrame) -> dict:
     results = {}
-
-    # Score buckets
-    score_buckets = [(45, 55, '45-54'), (55, 65, '55-64'), (65, 75, '65-74'),
-                     (75, 85, '75-84'), (85, 999, '85+')]
-    rows = []
-    for lo, hi, label in score_buckets:
-        sub = df[(df['entry_score'] >= lo) & (df['entry_score'] < hi)]
-        if len(sub) == 0:
+    variants = [
+        ('score_buckets', 'entry_score', [(45, 55, '45-54'), (55, 65, '55-64'),
+         (65, 75, '65-74'), (75, 85, '75-84'), (85, 999, '85+')]),
+        ('wallet_buckets', 'feat_wallets', [(0, 100, '0-100'), (100, 200, '100-200'),
+         (200, 400, '200-400'), (400, 800, '400-800'), (800, 1e9, '800+')]),
+        ('age_buckets', 'signal_age_ms', [(0, 5000, '0-5s'), (5000, 10000, '5-10s'),
+         (10000, 15000, '10-15s'), (15000, 20000, '15-20s'),
+         (20000, 30000, '20-30s'), (30000, 1e9, '30s+')]),
+    ]
+    for key, col, buckets in variants:
+        rows = []
+        if col not in df.columns:
             continue
-        wins = sub['is_win'].sum()
-        rows.append({
-            'bucket': label, 'n': len(sub), 'win_rate': wins / len(sub),
-            'avg_pnl': sub['pnl'].mean(), 'total_pnl': sub['pnl'].sum(),
-            'pf': sub[sub['pnl'] > 0]['pnl'].sum() / max(abs(sub[sub['pnl'] <= 0]['pnl'].sum()), 1e-9),
-        })
-    results['score_buckets'] = pd.DataFrame(rows)
+        for lo, hi, label in buckets:
+            sub = df[(df[col] >= lo) & (df[col] < hi)]
+            if len(sub) == 0:
+                continue
+            wins = sub['is_win'].sum()
+            gw = sub[sub['pnl'] > 0]['pnl'].sum()
+            gl = abs(sub[sub['pnl'] <= 0]['pnl'].sum())
+            rows.append({
+                'bucket': label, 'n': len(sub), 'win_rate': wins / len(sub),
+                'total_pnl': sub['pnl'].sum(),
+                'avg_roi': sub['pnl_percent'].mean() * 100,
+                'pf': gw / gl if gl > 1e-9 else float('inf'),
+            })
+        if rows:
+            results[key] = pd.DataFrame(rows)
 
-    # Wallet buckets
-    wallet_buckets = [(0, 100, '0-100'), (100, 200, '100-200'),
-                      (200, 400, '200-400'), (400, 800, '400-800'),
-                      (800, 1e9, '800+')]
-    rows = []
-    for lo, hi, label in wallet_buckets:
-        sub = df[(df['feat_wallets'] >= lo) & (df['feat_wallets'] < hi)] if 'feat_wallets' in df.columns else df.iloc[:0]
-        if len(sub) == 0:
-            continue
-        wins = sub['is_win'].sum()
-        rows.append({
-            'bucket': label, 'n': len(sub), 'win_rate': wins / len(sub),
-            'total_pnl': sub['pnl'].sum(),
-            'pf': sub[sub['pnl'] > 0]['pnl'].sum() / max(abs(sub[sub['pnl'] <= 0]['pnl'].sum()), 1e-9),
-        })
-    results['wallet_buckets'] = pd.DataFrame(rows)
-
-    # Age buckets
-    age_buckets = [(0, 5000, '0-5s'), (5000, 10000, '5-10s'),
-                   (10000, 15000, '10-15s'), (15000, 20000, '15-20s'),
-                   (20000, 30000, '20-30s'), (30000, 1e9, '30s+')]
-    rows = []
-    for lo, hi, label in age_buckets:
-        sub = df[(df['signal_age_ms'] >= lo) & (df['signal_age_ms'] < hi)]
-        if len(sub) == 0:
-            continue
-        wins = sub['is_win'].sum()
-        rows.append({
-            'bucket': label, 'n': len(sub), 'win_rate': wins / len(sub),
-            'total_pnl': sub['pnl'].sum(),
-            'pf': sub[sub['pnl'] > 0]['pnl'].sum() / max(abs(sub[sub['pnl'] <= 0]['pnl'].sum()), 1e-9),
-        })
-    results['age_buckets'] = pd.DataFrame(rows)
-
-    # Exit reason breakdown
     if 'exit_reason' in df.columns:
         results['exit_reasons'] = df.groupby('exit_reason').agg(
-            n=('pnl', 'count'),
-            win_rate=('is_win', 'mean'),
+            n=('pnl', 'count'), win_rate=('is_win', 'mean'),
             total_pnl=('pnl', 'sum'),
         ).reset_index()
-
     return results
 
 
 # ── Feature Importance (Logistic Regression) ─────────────────────────────────
 
-def feature_importance(df: pd.DataFrame) -> pd.DataFrame | None:
+def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame | None:
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    feat_cols = ['entry_score', 'signal_age_ms', 'entry_delay_ms', 'feat_wallets',
-                 'feat_liquidity', 'feat_buyRatio', 'feat_activity']
-    avail = [c for c in feat_cols if c in df.columns and df[c].notna().sum() > 5]
-    if len(avail) < 2:
+    avail = avail_features(df)
+    avail = [c for c in avail if c in df.columns and df[c].notna().sum() > 5]
+    if len(avail) < 2 or target not in df.columns:
         return None
 
     X = df[avail].fillna(0).values
-    y = df['is_win'].values
-
+    y = df[target].values
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
+    Xs = scaler.fit_transform(X)
     model = LogisticRegression(max_iter=1000, random_state=42)
-    model.fit(X_scaled, y)
-
-    imp = pd.DataFrame({
-        'feature': avail,
-        'coef': model.coef_[0],
-        'abs_coef': abs(model.coef_[0]),
+    model.fit(Xs, y)
+    return pd.DataFrame({
+        'feature': avail, 'coef': model.coef_[0], 'abs_coef': abs(model.coef_[0]),
     }).sort_values('abs_coef', ascending=False)
-    return imp
 
 
-# ── XGBoost Classifier ───────────────────────────────────────────────────────
+# ── XGBoost PnL Regressor ────────────────────────────────────────────────────
 
-def xgboost_analysis(df: pd.DataFrame) -> dict | None:
+def xgboost_regression(df: pd.DataFrame) -> dict | None:
     from sklearn.model_selection import cross_val_score, train_test_split
-    from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
+    from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
     import xgboost as xgb
 
-    feat_cols = ['entry_score', 'signal_age_ms', 'entry_delay_ms', 'feat_wallets',
-                 'feat_liquidity', 'feat_buyRatio', 'feat_activity']
-    avail = [c for c in feat_cols if c in df.columns and df[c].notna().sum() > 5]
+    avail = avail_features(df)
     if len(avail) < 2:
         return None
 
     X = df[avail].fillna(0).values
-    y = df['is_win'].values
+    y = df['pnl'].values
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
+        X, y, test_size=0.3, random_state=42
     )
 
-    model = xgb.XGBClassifier(
+    model = xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.1,
-        random_state=42, eval_metric='logloss',
+        random_state=42, objective='reg:squarederror',
     )
-    model.fit(X_train, y_train,
-              eval_set=[(X_test, y_test)],
-              verbose=False)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
     y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
+    cv_scores = cross_val_score(model, X, y, cv=min(5, len(df) // 3), scoring='neg_mean_absolute_error')
 
-    cv_scores = cross_val_score(model, X, y, cv=min(5, len(df) // 3))
+    # Direction accuracy: does sign(predicted) == sign(actual)?
+    dir_acc = (np.sign(y_pred) == np.sign(y_test)).mean()
 
-    # Feature importance from XGBoost
     imp = pd.DataFrame({
         'feature': avail,
         'importance': model.feature_importances_,
     }).sort_values('importance', ascending=False)
 
     return {
-        'model': model,
-        'feature_names': avail,
-        'accuracy': (y_pred == y_test).mean(),
-        'roc_auc': roc_auc_score(y_test, y_prob),
-        'cv_mean': cv_scores.mean(),
-        'cv_std': cv_scores.std(),
+        'model': model, 'feature_names': avail,
+        'r2': r2_score(y_test, y_pred),
+        'mae': mean_absolute_error(y_test, y_pred),
+        'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+        'direction_accuracy': dir_acc,
+        'cv_mae_mean': -cv_scores.mean(),
+        'cv_mae_std': cv_scores.std(),
         'feature_importance': imp,
-        'confusion_matrix': confusion_matrix(y_test, y_pred).tolist(),
-        'classification_report': classification_report(y_test, y_pred, output_dict=True),
-        'X_train': X_train, 'X_test': X_test, 'y_train': y_train, 'y_test': y_test,
-        'y_pred': y_pred, 'y_prob': y_prob,
+        'X_train': X_train, 'X_test': X_test,
+        'y_train': y_train, 'y_test': y_test,
+        'y_pred': y_pred,
     }
 
 
 # ── SHAP Explanation ─────────────────────────────────────────────────────────
 
-def shap_analysis(xgb_result: dict) -> dict | None:
+def shap_analysis(model_result: dict) -> dict | None:
     try:
         import shap
     except ImportError:
         return None
-
-    model = xgb_result['model']
-    X_test = xgb_result['X_test']
-    feature_names = xgb_result['feature_names']
-
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_test)
-
-    # Global feature importance via SHAP
-    mean_shap = np.abs(shap_values).mean(axis=0)
-    imp = pd.DataFrame({
-        'feature': feature_names,
-        'mean_shap': mean_shap,
-    }).sort_values('mean_shap', ascending=False)
-
+    model = model_result['model']
+    X_test = model_result['X_test']
+    names = model_result['feature_names']
+    explainer = shap.Explainer(model, X_test)
+    shap_values = explainer(X_test)
+    mean_shap = np.abs(shap_values.values).mean(axis=0)
     return {
-        'explainer': explainer,
-        'shap_values': shap_values,
-        'feature_importance': imp,
-        'n_samples': len(X_test),
+        'explainer': explainer, 'shap_values': shap_values,
+        'feature_importance': pd.DataFrame({
+            'feature': names, 'mean_shap': mean_shap,
+        }).sort_values('mean_shap', ascending=False),
     }
 
 
-# ── Optuna Weight Optimization ───────────────────────────────────────────────
+# ── Optuna Full-Parameter Optimization ───────────────────────────────────────
 
-def optuna_optimize(df: pd.DataFrame, n_trials: int = 500) -> dict | None:
-    """Optimize scorer weights using Optuna to maximize profit factor."""
+def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
+    """
+    Optimize scorer weights + filter thresholds + exit params to maximize PF.
+    Filters trades by score threshold so earlier weights determine which trades exist.
+    """
     try:
         import optuna
     except ImportError:
         return None
 
-    from engine import FeatureSnapshot, Filters, Scorer
+    from engine import FeatureSnapshot, Scorer
 
-    # We need raw snapshot features per trade
-    snapshots = []
+    raw = []
     for _, row in df.iterrows():
-        snapshots.append({
-            'wallet_count': row.get('feat_wallets', 0),
-            'liquidity': row.get('feat_liquidity', 0),
-            'buy_ratio': row.get('feat_buyRatio', 0),
-            'time_since_launch_ms': row.get('signal_age_ms', 0),
-            'is_win': row['is_win'],
+        raw.append({
+            'wallet': row.get('feat_wallets', 0),
+            'liq': row.get('feat_liquidity', 0),
+            'buy_r': row.get('feat_buyRatio', 0.5),
+            'age_ms': row.get('signal_age_ms', 0),
             'pnl': row['pnl'],
         })
-    if len(snapshots) < 10:
+    if len(raw) < 10:
         return None
 
-    def compute_pf(weights: dict, snaps: list) -> float:
-        w_wallet, w_age, w_liq = weights['wallet'], weights['age'], weights['liq']
-        total_w = w_wallet + w_age + w_liq
-        w_wallet /= total_w
-        w_age /= total_w
-        w_liq /= total_w
+    scorer = Scorer()
+    def cw(w): return scorer._wallet_score(w)
+    def ca(a): return scorer._signal_age_score(a)
+    def cl(l): return scorer._liquidity_score(l)
 
-        trades = []
-        for s in snaps:
-            snap = FeatureSnapshot(
-                mint='', timestamp=0,
-                wallet_count=s['wallet_count'],
-                liquidity=s['liquidity'],
-                buy_ratio=s['buy_ratio'],
-                time_since_launch_ms=s['time_since_launch_ms'],
-            )
-            score = (w_wallet * calc_wallet(s['wallet_count']) +
-                     w_age * calc_signal_age(s['time_since_launch_ms']) +
-                     w_liq * calc_liquidity(s['liquidity'])) * 100
-            trades.append({'is_win': s['is_win'], 'pnl': s['pnl'], 'score': score})
-        if not trades:
+    def compute_score(w_wallet, w_age, w_liq, wallet_count, liq, age_ms):
+        tw = w_wallet + w_age + w_liq
+        s = (w_wallet / tw * cw(wallet_count) +
+             w_age / tw * ca(age_ms) +
+             w_liq / tw * cl(liq)) * 100
+        return s
+
+    def filtered_pf(params: dict) -> float:
+        min_score = params['min_score']
+        min_wallet = params['min_wallet']
+        min_buy_r = params['min_buy_r']
+        min_age = params['min_age']
+        sl = params['stop_loss']
+        tp = params['take_profit']
+        be = params['break_even']
+
+        selected = []
+        for r in raw:
+            if r['wallet'] < min_wallet:
+                continue
+            if r['buy_r'] < min_buy_r:
+                continue
+            if r['age_ms'] < min_age:
+                continue
+            score = compute_score(params['w_wallet'], params['w_age'],
+                                  params['w_liq'], r['wallet'], r['liq'], r['age_ms'])
+            if score < min_score:
+                continue
+            selected.append(r)
+
+        if len(selected) < 3:
             return 0
 
-        gross_win = sum(t['pnl'] for t in trades if t['pnl'] > 0)
-        gross_loss = abs(sum(t['pnl'] for t in trades if t['pnl'] <= 0))
-        return gross_win / gross_loss if gross_loss > 1e-9 else 999
+        # Apply exit params for rough PnL estimation
+        adj_pnls = []
+        for r in selected:
+            pnl_pct = r['pnl'] / (r.get('entry_price', 1) or 1)
+            # Cap losses at SL
+            if pnl_pct < sl:
+                pnl_pct = sl
+            # Cap wins at TP
+            if pnl_pct > tp:
+                pnl_pct = tp
+            # Break-even: if MFE exceeded BE threshold, floor loss at 0
+            # (approximation — we don't have MFE in raw)
+            adj_pnls.append(pnl_pct * 100)
 
-    s_snap = FeatureSnapshot(mint='', timestamp=0, wallet_count=500, liquidity=1000, buy_ratio=0.5, time_since_launch_ms=15000)
-    s_scorer = Scorer()
-
-    def calc_wallet(w): return s_scorer._wallet_score(w)
-    def calc_signal_age(a): return s_scorer._signal_age_score(a)
-    def calc_liquidity(l): return s_scorer._liquidity_score(l)
+        gross_win = sum(p for p in adj_pnls if p > 0)
+        gross_loss = abs(sum(p for p in adj_pnls if p < 0))
+        if gross_loss < 1e-9:
+            return 999 if gross_win > 0 else 0
+        return gross_win / gross_loss
 
     def objective(trial):
-        w_wallet = trial.suggest_float('wallet', 0.05, 0.8)
-        w_age = trial.suggest_float('age', 0.05, 0.8)
-        w_liq = trial.suggest_float('liq', 0.05, 0.8)
-        return compute_pf({'wallet': w_wallet, 'age': w_age, 'liq': w_liq}, snapshots)
+        return filtered_pf({
+            'w_wallet': trial.suggest_float('w_wallet', 0.05, 0.9),
+            'w_age': trial.suggest_float('w_age', 0.05, 0.9),
+            'w_liq': trial.suggest_float('w_liq', 0.05, 0.9),
+            'min_score': trial.suggest_int('min_score', 30, 85, step=5),
+            'min_wallet': trial.suggest_int('min_wallet', 10, 100, step=10),
+            'min_buy_r': trial.suggest_float('min_buy_r', 0.20, 0.60, step=0.05),
+            'min_age': trial.suggest_int('min_age', 0, 20000, step=2000),
+            'stop_loss': trial.suggest_float('stop_loss', -0.50, -0.10, step=0.05),
+            'take_profit': trial.suggest_float('take_profit', 0.20, 1.0, step=0.10),
+            'break_even': trial.suggest_float('break_even', 0.05, 0.30, step=0.05),
+        })
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     best = study.best_params
-    total = best['wallet'] + best['age'] + best['liq']
-    best_norm = {k: v / total for k, v in best.items()}
-
+    tw = best['w_wallet'] + best['w_age'] + best['w_liq']
+    best_norm = {
+        'wallet': best['w_wallet'] / tw,
+        'age': best['w_age'] / tw,
+        'liq': best['w_liq'] / tw,
+    }
     return {
-        'best_params_raw': best,
-        'best_params_norm': best_norm,
-        'best_value': study.best_value,
+        'best_params': best,
+        'best_weights_norm': best_norm,
+        'best_pf': study.best_value,
         'trials': n_trials,
         'study': study,
+        'n_params': len(best),
     }
 
 
@@ -326,59 +348,48 @@ def run_analysis(trades_csv: str | Path, rejected_csv: str | Path | None = None)
     print("Loading trades...")
     df = load_trades_from_csv(trades_csv)
     print(f"  {len(df)} trades loaded")
-
     if rejected_csv:
         rej = load_rejected_from_csv(rejected_csv)
         print(f"  {len(rej)} rejected signals loaded")
-    else:
-        rej = None
 
     result = {'n_trades': len(df)}
-
-    # Basic stats
     wins = df[df['is_win'] == 1]
     losses = df[df['is_win'] == 0]
     result['win_rate'] = len(wins) / len(df) if len(df) else 0
     result['total_pnl'] = df['pnl'].sum()
     result['avg_win'] = wins['pnl'].mean() if len(wins) else 0
     result['avg_loss'] = losses['pnl'].mean() if len(losses) else 0
-    gross_win = wins['pnl'].sum()
-    gross_loss = abs(losses['pnl'].sum())
-    result['pf'] = gross_win / gross_loss if gross_loss > 1e-9 else float('inf')
+    gw = wins['pnl'].sum()
+    gl = abs(losses['pnl'].sum())
+    result['pf'] = gw / gl if gl > 1e-9 else float('inf')
+    print(f"  Win rate: {result['win_rate']*100:.1f}%  PnL: ${result['total_pnl']:.4f}  PF: {result['pf']:.2f}")
 
-    print(f"  Win rate: {result['win_rate']*100:.1f}%")
-    print(f"  PnL: ${result['total_pnl']:.4f}")
-    print(f"  PF: {result['pf']:.2f}")
-
-    # Buckets
-    print("\nScore buckets...")
     result['buckets'] = bucket_analysis(df)
 
-    # Feature importance
+    # Rolling metrics
+    result['rolling'] = rolling_metrics(df)
+
+    # Feature importance (logistic regression)
     if len(avail_features(df)) >= 2:
         print("Feature importance (logistic regression)...")
         result['feature_importance_lr'] = feature_importance(df)
 
-        print("XGBoost classifier...")
-        result['xgb'] = xgboost_analysis(df)
+    # XGBoost PnL regression
+    if len(avail_features(df)) >= 2:
+        print("XGBoost PnL regression...")
+        result['xgb'] = xgboost_regression(df)
         if result.get('xgb'):
-            print(f"  Accuracy: {result['xgb']['accuracy']:.3f}  ROC-AUC: {result['xgb']['roc_auc']:.3f}")
-            print(f"  CV: {result['xgb']['cv_mean']:.3f} ± {result['xgb']['cv_std']:.3f}")
+            x = result['xgb']
+            print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  DirAcc={x['direction_accuracy']:.1%}")
+            print(f"  CV MAE={x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
 
             print("SHAP analysis...")
-            result['shap'] = shap_analysis(result['xgb'])
+            result['shap'] = shap_analysis(x)
             if result.get('shap'):
-                print(f"  Top features: {result['shap']['feature_importance'].head(3).to_string(index=False)}")
-    else:
-        print("Not enough features for ML analysis")
+                top = result['shap']['feature_importance'].head(5)
+                print(f"  Top features:\n{top.to_string(index=False)}")
 
     return result
-
-
-def avail_features(df: pd.DataFrame) -> list:
-    feat_cols = ['entry_score', 'signal_age_ms', 'entry_delay_ms',
-                 'feat_wallets', 'feat_liquidity', 'feat_buyRatio', 'feat_activity']
-    return [c for c in feat_cols if c in df.columns and df[c].notna().sum() > 5]
 
 
 def print_report(result: dict):
@@ -389,28 +400,44 @@ def print_report(result: dict):
           f"PnL: ${result['total_pnl']:.4f}  PF: {result['pf']:.2f}")
 
     if 'buckets' in result:
-        for key, label in [('score_buckets', 'Score'), ('wallet_buckets', 'Wallet'), ('age_buckets', 'Age')]:
+        for key, label in [('score_buckets', 'Score Buckets'),
+                           ('wallet_buckets', 'Wallet Buckets'),
+                           ('age_buckets', 'Age Buckets'),
+                           ('exit_reasons', 'Exit Reasons')]:
             bdf = result['buckets'].get(key)
             if bdf is not None and len(bdf):
-                print(f"\n{label} Buckets:")
+                print(f"\n{label}:")
                 print(bdf.to_string(index=False))
+
+    if not result.get('rolling', pd.DataFrame()).empty:
+        r = result['rolling']
+        print(f"\nRolling {len(r)}-trade windows:")
+        print(f"  PF went from {r['rolling_pf'].iloc[0]:.2f} → {r['rolling_pf'].iloc[-1]:.2f}")
+        print(f"  WR went from {r['rolling_wr'].iloc[0]:.1%} → {r['rolling_wr'].iloc[-1]:.1%}")
+        max_dd = r['rolling_dd'].min()
+        print(f"  Max drawdown: {max_dd:.1%}")
 
     if result.get('xgb'):
         x = result['xgb']
-        print(f"\nXGBoost Classifier:")
-        print(f"  Accuracy: {x['accuracy']:.3f}  ROC-AUC: {x['roc_auc']:.3f}")
-        print(f"  CV: {x['cv_mean']:.3f} ± {x['cv_std']:.3f}")
+        print(f"\nXGBoost PnL Regressor:")
+        print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  RMSE=${x['rmse']:.4f}")
+        print(f"  Direction accuracy: {x['direction_accuracy']:.1%}")
+        print(f"  CV MAE: {x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
         print(f"\nFeature Importance:")
         print(x['feature_importance'].to_string(index=False))
 
     if result.get('shap'):
-        print(f"\nSHAP Feature Importance:")
+        print(f"\nSHAP Feature Importance (mean |SHAP|):")
         print(result['shap']['feature_importance'].to_string(index=False))
+
+    if result.get('feature_importance_lr') is not None:
+        print(f"\nLogistic Regression Coefficients:")
+        print(result['feature_importance_lr'].to_string(index=False))
 
 
 if __name__ == '__main__':
     import sys
-    trades_csv = sys.argv[1] if len(sys.argv) > 1 else 'data/trades.csv'
-    rejected_csv = sys.argv[2] if len(sys.argv) > 2 else None
-    result = run_analysis(trades_csv, rejected_csv)
-    print_report(result)
+    tc = sys.argv[1] if len(sys.argv) > 1 else 'data/trades.csv'
+    rc = sys.argv[2] if len(sys.argv) > 2 else None
+    r = run_analysis(tc, rc)
+    print_report(r)

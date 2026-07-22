@@ -100,22 +100,21 @@ def run(hours: int = 2, n_trials: int = 200):
     )
     print_report(analysis_result)
 
-    # Step 4: Optuna weight optimization
+    # Step 4: Optuna full-parameter optimization
     print(f"\n{'='*60}")
-    print(f"STEP 4: Optuna Weight Optimization ({n_trials} trials)")
+    print(f"STEP 4: Optuna Full-Parameter Optimization ({n_trials} trials)")
     print(f"{'='*60}")
-    trades_df = pd.read_csv(paths['trades'])
-    from analysis import optuna_optimize, avail_features, load_trades_from_csv
+    from analysis import optuna_optimize, load_trades_from_csv
     df = load_trades_from_csv(paths['trades'])
     opt_result = optuna_optimize(df, n_trials=n_trials)
     if opt_result:
-        print(f"  Best PF: {opt_result['best_value']:.2f}")
-        print(f"  Best weights (raw):  wallet={opt_result['best_params_raw']['wallet']:.3f}, "
-              f"age={opt_result['best_params_raw']['age']:.3f}, "
-              f"liq={opt_result['best_params_raw']['liq']:.3f}")
-        print(f"  Best weights (norm): wallet={opt_result['best_params_norm']['wallet']:.3f}, "
-              f"age={opt_result['best_params_norm']['age']:.3f}, "
-              f"liq={opt_result['best_params_norm']['liq']:.3f}")
+        print(f"  Best PF: {opt_result['best_pf']:.2f}")
+        print(f"  Best normalized weights:")
+        bn = opt_result['best_weights_norm']
+        print(f"    wallet={bn['wallet']:.3f}  age={bn['age']:.3f}  liq={bn['liq']:.3f}")
+        print(f"  Best full params:")
+        for k, v in sorted(opt_result['best_params'].items()):
+            print(f"    {k}: {v}")
     else:
         print("  Not enough data for optimization.")
 
