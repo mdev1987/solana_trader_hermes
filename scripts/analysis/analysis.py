@@ -70,6 +70,7 @@ def avail_features(df: pd.DataFrame) -> list:
 # ── Rolling Metrics ──────────────────────────────────────────────────────────
 
 def rolling_metrics(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """Rolling PF/WR and equity-curve drawdown (from cumulative realized PnL)."""
     if len(df) < window * 2:
         return pd.DataFrame()
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
@@ -78,15 +79,18 @@ def rolling_metrics(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     gross_loss = roll['pnl'].apply(lambda x: abs(x[x <= 0].sum()))
     pf = gross_win / gross_loss.replace(0, np.nan)
     wr = roll['is_win'].mean()
-    cum_pnl = roll['pnl'].sum()
-    rolling_max = cum_pnl.cummax()
-    dd = (cum_pnl - rolling_max) / (rolling_max + 1e-9)
+
+    # Equity-curve drawdown: cumulative realized PnL, peak-to-trough
+    equity = df_sorted['pnl'].cumsum()
+    rolling_max = equity.expanding().max()
+    dd = (equity - rolling_max) / (rolling_max + 1e-9)
+
     return pd.DataFrame({
         'trade_end': df_sorted['exit_time'],
         'rolling_pf': pf,
         'rolling_wr': wr,
-        'rolling_pnl': cum_pnl,
-        'rolling_dd': dd,
+        'equity': equity,
+        'drawdown': dd,
     }).dropna().reset_index(drop=True)
 
 
@@ -224,121 +228,164 @@ def shap_analysis(model_result: dict) -> dict | None:
     }
 
 
-# ── Optuna Full-Parameter Optimization ───────────────────────────────────────
+# ── Optuna Full-Parameter Optimization with Walk-Forward ─────────────────────
+
+def simulate_trade_exit(row: dict, params: dict) -> float:
+    """
+    Simulate exit for a single trade given params.
+    Order matches live engine: SL/TP caps → break-even → trailing stop.
+    Returns the realized pnl_percent.
+    """
+    pnl_pct = row['pnl_pct_actual']
+    mfe = row['mfe']
+    sl = abs(params['stop_loss'])
+    tp = params['take_profit']
+    be = params['break_even']
+    trail_act = params.get('trail_activate', 0.25)
+    trail_dist = params.get('trail_distance', 0.12)
+
+    if pnl_pct < -sl:
+        pnl_pct = -sl
+    if pnl_pct > tp:
+        pnl_pct = tp
+
+    if mfe >= be and pnl_pct < 0:
+        pnl_pct = 0.0
+
+    if mfe >= trail_act:
+        trail_price = (1 + mfe) * (1 - trail_dist) - 1
+        if trail_price > pnl_pct:
+            pnl_pct = trail_price
+
+    return pnl_pct
+
+
+def filtered_pnl_percents(params: dict, raw: list) -> list:
+    selected = []
+    for r in raw:
+        if r['wallet'] < params['min_wallet']:
+            continue
+        if r['buy_r'] < params['min_buy_r']:
+            continue
+        if r['age_ms'] < params['min_age']:
+            continue
+        score = compute_score(params['w_wallet'], params['w_age'],
+                              params['w_liq'], r['wallet'], r['liq'], r['age_ms'])
+        if score < params['min_score']:
+            continue
+        adj = simulate_trade_exit(r, params)
+        selected.append({'pnl_pct': adj, 'pnl': r.get('pnl', 0)})
+    return selected
+
+
+def pf_from_pnl_list(trades: list) -> float:
+    if len(trades) < 3:
+        return 0
+    gross_win = sum(abs(t['pnl']) for t in trades if t['pnl_pct'] > 0)
+    gross_loss = sum(abs(t['pnl']) for t in trades if t['pnl_pct'] <= 0)
+    if gross_loss < 1e-9:
+        return 999 if gross_win > 0 else 0
+    return gross_win / gross_loss
+
+
+def compute_score(w_wallet, w_age, w_liq, wallet_count, liq, age_ms):
+    from engine import Scorer
+    sc = Scorer()
+    tw = w_wallet + w_age + w_liq
+    return (w_wallet / tw * sc._wallet_score(wallet_count) +
+            w_age / tw * sc._signal_age_score(age_ms) +
+            w_liq / tw * sc._liquidity_score(liq)) * 100
+
+
+def compute_pf_full(params: dict, raw: list) -> float:
+    return pf_from_pnl_list(filtered_pnl_percents(params, raw))
+
 
 def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     """
-    Optimize scorer weights + filter thresholds + exit params to maximize PF.
-    Filters trades by score threshold so earlier weights determine which trades exist.
+    Optimize weights + filters + exits to maximize PF.
+    Uses walk-forward: trains on first 60% of chronologically-sorted trades,
+    evaluates on last 40%. Returns both in-sample and out-of-sample PF.
     """
     try:
         import optuna
     except ImportError:
         return None
 
-    from engine import FeatureSnapshot, Scorer
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    split = int(len(df_sorted) * 0.6)
+    if split < 10 or len(df_sorted) - split < 5:
+        split = max(len(df_sorted) - 5, 5)
 
-    raw = []
-    for _, row in df.iterrows():
-        raw.append({
-            'wallet': row.get('feat_wallets', 0),
-            'liq': row.get('feat_liquidity', 0),
-            'buy_r': row.get('feat_buyRatio', 0.5),
-            'age_ms': row.get('signal_age_ms', 0),
-            'pnl': row['pnl'],
-        })
-    if len(raw) < 10:
+    train_raw = _df_to_raw(df_sorted.iloc[:split])
+    test_raw = _df_to_raw(df_sorted.iloc[split:])
+
+    if len(train_raw) < 5:
         return None
 
-    scorer = Scorer()
-    def cw(w): return scorer._wallet_score(w)
-    def ca(a): return scorer._signal_age_score(a)
-    def cl(l): return scorer._liquidity_score(l)
-
-    def compute_score(w_wallet, w_age, w_liq, wallet_count, liq, age_ms):
-        tw = w_wallet + w_age + w_liq
-        s = (w_wallet / tw * cw(wallet_count) +
-             w_age / tw * ca(age_ms) +
-             w_liq / tw * cl(liq)) * 100
-        return s
-
-    def filtered_pf(params: dict) -> float:
-        min_score = params['min_score']
-        min_wallet = params['min_wallet']
-        min_buy_r = params['min_buy_r']
-        min_age = params['min_age']
-        sl = params['stop_loss']
-        tp = params['take_profit']
-        be = params['break_even']
-
-        selected = []
-        for r in raw:
-            if r['wallet'] < min_wallet:
-                continue
-            if r['buy_r'] < min_buy_r:
-                continue
-            if r['age_ms'] < min_age:
-                continue
-            score = compute_score(params['w_wallet'], params['w_age'],
-                                  params['w_liq'], r['wallet'], r['liq'], r['age_ms'])
-            if score < min_score:
-                continue
-            selected.append(r)
-
-        if len(selected) < 3:
-            return 0
-
-        # Apply exit params for rough PnL estimation
-        adj_pnls = []
-        for r in selected:
-            pnl_pct = r['pnl'] / (r.get('entry_price', 1) or 1)
-            # Cap losses at SL
-            if pnl_pct < sl:
-                pnl_pct = sl
-            # Cap wins at TP
-            if pnl_pct > tp:
-                pnl_pct = tp
-            # Break-even: if MFE exceeded BE threshold, floor loss at 0
-            # (approximation — we don't have MFE in raw)
-            adj_pnls.append(pnl_pct * 100)
-
-        gross_win = sum(p for p in adj_pnls if p > 0)
-        gross_loss = abs(sum(p for p in adj_pnls if p < 0))
-        if gross_loss < 1e-9:
-            return 999 if gross_win > 0 else 0
-        return gross_win / gross_loss
-
     def objective(trial):
-        return filtered_pf({
-            'w_wallet': trial.suggest_float('w_wallet', 0.05, 0.9),
-            'w_age': trial.suggest_float('w_age', 0.05, 0.9),
-            'w_liq': trial.suggest_float('w_liq', 0.05, 0.9),
-            'min_score': trial.suggest_int('min_score', 30, 85, step=5),
-            'min_wallet': trial.suggest_int('min_wallet', 10, 100, step=10),
-            'min_buy_r': trial.suggest_float('min_buy_r', 0.20, 0.60, step=0.05),
-            'min_age': trial.suggest_int('min_age', 0, 20000, step=2000),
-            'stop_loss': trial.suggest_float('stop_loss', -0.50, -0.10, step=0.05),
-            'take_profit': trial.suggest_float('take_profit', 0.20, 1.0, step=0.10),
-            'break_even': trial.suggest_float('break_even', 0.05, 0.30, step=0.05),
-        })
+        params = _suggest_params(trial)
+        return compute_pf_full(params, train_raw)
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     best = study.best_params
+    train_pf = study.best_value
+    test_pf = compute_pf_full(best, test_raw)
+
     tw = best['w_wallet'] + best['w_age'] + best['w_liq']
     best_norm = {
         'wallet': best['w_wallet'] / tw,
         'age': best['w_age'] / tw,
         'liq': best['w_liq'] / tw,
     }
+
     return {
         'best_params': best,
         'best_weights_norm': best_norm,
-        'best_pf': study.best_value,
+        'train_pf': train_pf,
+        'test_pf': test_pf,
+        'n_train': len(train_raw),
+        'n_test': len(test_raw),
         'trials': n_trials,
         'study': study,
         'n_params': len(best),
+    }
+
+
+def _df_to_raw(df_slice):
+    """Convert a DataFrame slice to the raw list format."""
+    raw = []
+    for _, row in df_slice.iterrows():
+        raw.append({
+            'wallet': row.get('feat_wallets', 0),
+            'liq': row.get('feat_liquidity', 0),
+            'buy_r': row.get('feat_buyRatio', 0.5),
+            'age_ms': row.get('signal_age_ms', 0),
+            'pnl': row['pnl'],
+            'pnl_pct_actual': row['pnl_percent'],
+            'mfe': row['mfe'] if 'mfe' in row and not pd.isna(row['mfe']) else 0,
+            'max_price': row.get('max_price', 0),
+            'entry_price': row.get('entry_price', 1),
+        })
+    return raw
+
+
+def _suggest_params(trial):
+    return {
+        'w_wallet': trial.suggest_float('w_wallet', 0.05, 0.9),
+        'w_age': trial.suggest_float('w_age', 0.05, 0.9),
+        'w_liq': trial.suggest_float('w_liq', 0.05, 0.9),
+        'min_score': trial.suggest_int('min_score', 30, 85, step=5),
+        'min_wallet': trial.suggest_int('min_wallet', 10, 100, step=10),
+        'min_buy_r': trial.suggest_float('min_buy_r', 0.20, 0.60, step=0.05),
+        'min_age': trial.suggest_int('min_age', 0, 20000, step=2000),
+        'stop_loss': trial.suggest_float('stop_loss', -0.50, -0.10, step=0.05),
+        'take_profit': trial.suggest_float('take_profit', 0.20, 1.0, step=0.10),
+        'break_even': trial.suggest_float('break_even', 0.05, 0.30, step=0.05),
+        'trail_activate': trial.suggest_float('trail_activate', 0.10, 0.40, step=0.05),
+        'trail_distance': trial.suggest_float('trail_distance', 0.05, 0.25, step=0.05),
     }
 
 
@@ -412,9 +459,9 @@ def print_report(result: dict):
     if not result.get('rolling', pd.DataFrame()).empty:
         r = result['rolling']
         print(f"\nRolling {len(r)}-trade windows:")
-        print(f"  PF went from {r['rolling_pf'].iloc[0]:.2f} → {r['rolling_pf'].iloc[-1]:.2f}")
-        print(f"  WR went from {r['rolling_wr'].iloc[0]:.1%} → {r['rolling_wr'].iloc[-1]:.1%}")
-        max_dd = r['rolling_dd'].min()
+        print(f"  PF went from {r['rolling_pf'].iloc[0]:.2f} -> {r['rolling_pf'].iloc[-1]:.2f}")
+        print(f"  WR went from {r['rolling_wr'].iloc[0]:.1%} -> {r['rolling_wr'].iloc[-1]:.1%}")
+        max_dd = r['drawdown'].min()
         print(f"  Max drawdown: {max_dd:.1%}")
 
     if result.get('xgb'):
