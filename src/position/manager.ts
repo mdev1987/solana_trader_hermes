@@ -10,6 +10,7 @@ export class PositionManager {
   private takeProfit: TakeProfit;
   private trailingStop: TrailingStop;
   private deadHoldMs: number;
+  private breakEvenActivatePercent: number;
   ttlMs: number;
 
   constructor(config: StrategyConfig) {
@@ -17,6 +18,7 @@ export class PositionManager {
     this.takeProfit = new TakeProfit(config.takeProfitPercent);
     this.trailingStop = new TrailingStop(config.trailingStopActivatePercent, config.trailingStopDistance);
     this.deadHoldMs = config.maxDeadHoldMs;
+    this.breakEvenActivatePercent = config.breakEvenActivatePercent;
     this.ttlMs = config.positionTtlMs;
   }
 
@@ -34,6 +36,11 @@ export class PositionManager {
     }
     if (currentPrice < pos.lowestPrice) {
       pos.lowestPrice = currentPrice;
+    }
+
+    const breakEvenThreshold = pos.entryPrice * (1 + this.breakEvenActivatePercent);
+    if (pos.highestPrice >= breakEvenThreshold && pos.stopLoss < pos.entryPrice) {
+      pos.stopLoss = pos.entryPrice * 0.995;
     }
 
     if (this.stopLoss.isHit(currentPrice, pos.stopLoss)) {

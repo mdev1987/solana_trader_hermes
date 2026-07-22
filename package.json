@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "replay": "bun run src/main.ts replay",
+    "replay_all":"bun run scripts/replay_all_v2.ts",
     "rank": "bun run src/main.ts rank",
     "heatmap": "bun run src/main.ts heatmap",
     "optimize": "bun run src/main.ts optimize",

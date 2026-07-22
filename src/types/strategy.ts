@@ -4,7 +4,9 @@ export interface StrategyConfig {
   minScore: number;
   minLiquidity: number;
   maxLiquidity: number;
+  minSignalAgeMs: number;
   maxSignalAgeMs: number;
+  minWalletCount: number;
   maxDeadHoldMs: number;
   maxWallets: number;
   minActivityScore: number;
@@ -14,6 +16,7 @@ export interface StrategyConfig {
   takeProfitPercent: number;
   trailingStopActivatePercent: number;
   trailingStopDistance: number;
+  breakEvenActivatePercent: number;
   positionTtlMs: number;
   executionDelayMs: number;
   slippagePercent: number;

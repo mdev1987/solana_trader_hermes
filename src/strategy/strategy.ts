@@ -22,7 +22,7 @@ export class Strategy {
     }
 
     const score = this.scorer.score(snapshot);
-    if (score >= 98 && snapshot.walletCount < 100) {
+    if (score >= 70 && snapshot.walletCount < 100) {
       return { decision: 'SKIP', score, reason: 'high_score_low_wallets' };
     }
     const decision = this.decisionMaker.decide(score, snapshot);

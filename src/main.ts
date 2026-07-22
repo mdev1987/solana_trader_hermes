@@ -31,7 +31,6 @@ interface PendingBuy {
 
 const PENDING_BUY_TIMEOUT_MS = 10_000;
 const FILL_WINDOW_MS = 500;
-const DECISION_DELAY_MS = 2000;
 
 export async function main() {
   const args = process.argv.slice(2);
@@ -173,10 +172,6 @@ async function runReplay(args: string[]): Promise<void> {
 
     const snapshot = featureBuilder.fromReplayEvent(event);
     if (!snapshot) return;
-    if (snapshot.timeSinceLaunchMs < DECISION_DELAY_MS) {
-      logRejection(event.mint, event.timestamp, snapshot, 0, 'too_early', price);
-      return;
-    }
     featureStore.set(snapshot);
 
     const { decision, score, reason } = strategy.evaluate(snapshot);

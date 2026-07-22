@@ -30,7 +30,6 @@ interface PendingBuy {
 
 const PENDING_BUY_TIMEOUT_MS = 10_000;
 const FILL_WINDOW_MS = 500;
-const DECISION_DELAY_MS = 2000;
 
 function findReplayFiles(): string[] {
   const base = ENV.DATA_DIR;
@@ -148,10 +147,6 @@ async function main() {
 
       const snapshot = featureBuilder.fromReplayEvent(event);
       if (!snapshot) return;
-      if (snapshot.timeSinceLaunchMs < DECISION_DELAY_MS) {
-        logRejection(event.mint, event.timestamp, snapshot, 0, 'too_early', price);
-        return;
-      }
       featureStore.set(snapshot);
 
       const { decision, score, reason } = strategy.evaluate(snapshot);

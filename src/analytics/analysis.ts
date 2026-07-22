@@ -279,7 +279,7 @@ export function analyzeDb(csv = false): void {
       }
 
       // Pipeline summary using the same order as strategy flow
-      const filterReasons = ['too_early', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score', 'high_score_low_wallets'];
+      const filterReasons = ['too_early', 'wallets_below_min', 'liquidity_below_min', 'liquidity_above_max', 'signal_too_old', 'wallets_above_max', 'buy_ratio_too_low', 'below_min_score', 'high_score_low_wallets'];
       const reasonMap = new Map(byReason.map(r => [r.reason, r]));
       console.log(`\n  Rejection pipeline (top → bottom):`);
       const pipeline: { reason: string; count: number; cumPct: string }[] = [];
@@ -413,10 +413,11 @@ export function analyzeDb(csv = false): void {
   // ── Score Calibration ──
   console.log('\n─── Score Calibration ───');
   const scoreBuckets = [
-    { label: '85-89', min: 85, max: 90 },
-    { label: '90-94', min: 90, max: 95 },
-    { label: '95-97', min: 95, max: 98 },
-    { label: '98-100', min: 98, max: 101 },
+    { label: '45-54', min: 45, max: 55 },
+    { label: '55-64', min: 55, max: 65 },
+    { label: '65-74', min: 65, max: 75 },
+    { label: '75-84', min: 75, max: 85 },
+    { label: '85+', min: 85, max: 999 },
   ];
   console.log(`  ${'Bucket'.padEnd(10)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'AvgROI'.padStart(9)} ${'AvgMFE'.padStart(9)} ${'PF'.padStart(6)}`);
   let prevRoi = -Infinity;
@@ -504,6 +505,104 @@ export function analyzeDb(csv = false): void {
     console.log('  (need both winners and losers)');
   }
 
+  // ── Wallet Buckets ──
+  console.log('\n─── Wallet Buckets ───');
+  const walletBuckets = [
+    { label: '0-100',       min: 0, max: 100 },
+    { label: '100-200',     min: 100, max: 200 },
+    { label: '200-400',     min: 200, max: 400 },
+    { label: '400-800',     min: 400, max: 800 },
+    { label: '800+',        min: 800, max: Infinity },
+  ];
+  console.log(`  ${'Wallets'.padEnd(12)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'PnL'.padStart(12)} ${'PF'.padStart(6)} ${'AvgROI'.padStart(9)}`);
+  for (const b of walletBuckets) {
+    const subset = trades.filter(t => {
+      const w = Number(parseFeatures(t).wallets) || 0;
+      return w >= b.min && w < b.max;
+    });
+    if (subset.length === 0) continue;
+    const sm = calculateMetrics(subset);
+    const avgRoi = subset.reduce((s, t) => s + t.pnlPercent, 0) / subset.length * 100;
+    console.log(`  ${b.label.padEnd(12)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor.toFixed(1).padStart(6)} ${avgRoi.toFixed(1).padStart(8)}%`);
+  }
+
+  // ── Signal Age Buckets ──
+  console.log('\n─── Signal Age Buckets ───');
+  const ageBuckets = [
+    { label: '0-5s',        min: 0, max: 5000 },
+    { label: '5-10s',       min: 5000, max: 10000 },
+    { label: '10-15s',      min: 10000, max: 15000 },
+    { label: '15-20s',      min: 15000, max: 20000 },
+    { label: '20-30s',      min: 20000, max: 30000 },
+    { label: '30s+',        min: 30000, max: Infinity },
+  ];
+  console.log(`  ${'Age'.padEnd(12)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'PnL'.padStart(12)} ${'PF'.padStart(6)} ${'AvgROI'.padStart(9)}`);
+  for (const b of ageBuckets) {
+    const subset = trades.filter(t => t.signalAgeMs >= b.min && t.signalAgeMs < b.max);
+    if (subset.length === 0) continue;
+    const sm = calculateMetrics(subset);
+    const avgRoi = subset.reduce((s, t) => s + t.pnlPercent, 0) / subset.length * 100;
+    console.log(`  ${b.label.padEnd(12)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor.toFixed(1).padStart(6)} ${avgRoi.toFixed(1).padStart(8)}%`);
+  }
+
+  // ── Buy Ratio Buckets ──
+  console.log('\n─── Buy Ratio Buckets ───');
+  const buyRatioBuckets = [
+    { label: '<0.45',       min: 0, max: 0.45 },
+    { label: '0.45-0.55',   min: 0.45, max: 0.55 },
+    { label: '0.55-0.65',   min: 0.55, max: 0.65 },
+    { label: '0.65+',       min: 0.65, max: Infinity },
+  ];
+  console.log(`  ${'BuyRatio'.padEnd(12)} ${'N'.padStart(3)} ${'Win%'.padStart(6)} ${'PnL'.padStart(12)} ${'PF'.padStart(6)} ${'AvgROI'.padStart(9)}`);
+  for (const b of buyRatioBuckets) {
+    const subset = trades.filter(t => {
+      const br = Number(parseFeatures(t).buyRatio) || 0;
+      return br >= b.min && br < b.max;
+    });
+    if (subset.length === 0) continue;
+    const sm = calculateMetrics(subset);
+    const avgRoi = subset.reduce((s, t) => s + t.pnlPercent, 0) / subset.length * 100;
+    console.log(`  ${b.label.padEnd(12)} ${subset.length.toString().padStart(3)} ${(sm.winRate*100).toFixed(0).padStart(5)}% ${fmtUsd(sm.totalPnl).padStart(12)} ${sm.profitFactor.toFixed(1).padStart(6)} ${avgRoi.toFixed(1).padStart(8)}%`);
+  }
+
+  // ── 2D Heatmap: Wallets × SignalAge ──
+  console.log('\n─── 2D Heatmap: Wallets × SignalAge (Win% / PF) ───');
+  const walletRanges = ['0-100', '100-300', '300-600', '600+'];
+  const ageRanges = ['<10s', '10-20s', '20-30s', '30s+'];
+  const walletBounds = [
+    { min: 0, max: 100 },
+    { min: 100, max: 300 },
+    { min: 300, max: 600 },
+    { min: 600, max: Infinity },
+  ];
+  const ageBounds = [
+    { min: 0, max: 10000 },
+    { min: 10000, max: 20000 },
+    { min: 20000, max: 30000 },
+    { min: 30000, max: Infinity },
+  ];
+  const header = `${''.padEnd(14)} ${ageRanges.map(a => a.padStart(14)).join('')}`;
+  console.log(header);
+  for (let wi = 0; wi < walletRanges.length; wi++) {
+    const wr = walletRanges[wi]!;
+    const wb = walletBounds[wi]!;
+    const cells: string[] = [];
+    for (let ai = 0; ai < ageRanges.length; ai++) {
+      const ab = ageBounds[ai]!;
+      const cell = trades.filter(t => {
+        const w = Number(parseFeatures(t).wallets) || 0;
+        return w >= wb.min && w < wb.max && t.signalAgeMs >= ab.min && t.signalAgeMs < ab.max;
+      });
+      if (cell.length === 0) {
+        cells.push(''.padStart(14));
+      } else {
+        const sm = calculateMetrics(cell);
+        cells.push(`${(sm.winRate*100).toFixed(0)}%/${sm.profitFactor.toFixed(1)}`.padStart(14));
+      }
+    }
+    console.log(`${wr.padEnd(14)} ${cells.join('')}`);
+  }
+
   // ── Failure Reasons ──
   console.log('\n─── Failure Reasons ───');
   interface FailureCat { label: string; n: number; }
@@ -542,6 +641,48 @@ export function analyzeDb(csv = false): void {
   console.log(`    Immediate dump (<5s):  ${immediateDumps}`);
   console.log(`    Slow bleed (≥5s):      ${slowBleeds}`);
   console.log(`    Avg time to exit:      ${fmtHold(losers.reduce((s, t) => s + (t.exitTime - t.entryTime), 0) / nLosses)}`);
+
+  // ── Never Profitable Analysis ──
+  console.log('\n─── Never Profitable Analysis ───');
+  const neverPos = trades.filter(t => t.pnl <= 0 && t.maxPrice <= t.entryPrice);
+  const allWinners = trades.filter(t => t.pnl > 0);
+  if (neverPos.length > 0 && allWinners.length > 0) {
+    const fields = [
+      { label: 'walletCount', accKey: 'wallets', rejKey: 'wallets', fmt: (v: number) => v.toFixed(0) },
+      { label: 'liquidity', accKey: 'liquidity', rejKey: 'liquidity', fmt: (v: number) => v.toFixed(0) },
+      { label: 'buyRatio', accKey: 'buyRatio', rejKey: 'buyRatio', fmt: (v: number) => v.toFixed(3) },
+      { label: 'signalAgeMs', accKey: 'signalAgeMs', rejKey: 'signalAgeMs', fmt: (v: number) => v.toFixed(0) },
+      { label: 'entryScore', accKey: 'entryScore', rejKey: 'entryScore', fmt: (v: number) => v.toFixed(1) },
+    ];
+    const getFeat = (t: TradeResult, key: string): number => {
+      if (key === 'entryScore') return t.entryScore;
+      if (key === 'signalAgeMs') return t.signalAgeMs;
+      const f = parseFeatures(t);
+      return Number(f[key]) || 0;
+    };
+    console.log(`  ${'Feature'.padEnd(16)} ${'NeverPos Avg'.padStart(12)} ${'Winner Avg'.padStart(12)} ${'Δ'.padStart(12)}  ${'NeverPos Trades'.padStart(20)}`);
+    for (const f of fields) {
+      const npv = neverPos.map(t => getFeat(t, f.rejKey));
+      const wv = allWinners.map(t => getFeat(t, f.accKey));
+      const npAvg = npv.reduce((s, v) => s + v, 0) / npv.length;
+      const wAvg = wv.reduce((s, v) => s + v, 0) / wv.length;
+      const delta = npAvg - wAvg;
+      const deltaStr = delta > 0 ? `${delta.toFixed(1)} higher` : `${(-delta).toFixed(1)} lower`;
+      const npStrs = neverPos.map(t => {
+        const v = getFeat(t, f.rejKey);
+        return `${f.fmt(v)}`;
+      });
+      console.log(`  ${f.label.padEnd(16)} ${f.fmt(npAvg).padStart(12)} ${f.fmt(wAvg).padStart(12)} ${deltaStr.padStart(12)}  ${npStrs.join(' | ').padStart(20)}`);
+    }
+    console.log(`  Never-profitable mints:`);
+    for (const t of neverPos) {
+      const age = (t.signalAgeMs / 1000).toFixed(1);
+      const hold = fmtHold(t.exitTime - t.entryTime);
+      console.log(`    ${t.mint}  score=${t.entryScore.toFixed(1)}  age=${age}s  hold=${hold}  pnl=${(t.pnlPercent*100).toFixed(1)}%`);
+    }
+  } else {
+    console.log('  No never-profitable trades found.');
+  }
 
   // ── Liquidity Buckets ──
   console.log('\n─── Liquidity Buckets ───');
