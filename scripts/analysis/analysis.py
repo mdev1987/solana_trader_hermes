@@ -69,7 +69,7 @@ def avail_features(df: pd.DataFrame) -> list:
 
 # ── Rolling Metrics ──────────────────────────────────────────────────────────
 
-def rolling_metrics(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+def rolling_metrics(df: pd.DataFrame, window: int = 20, initial_capital: float = 10.0) -> pd.DataFrame:
     """Rolling PF/WR and equity-curve drawdown (from cumulative realized PnL)."""
     if len(df) < window * 2:
         return pd.DataFrame()
@@ -80,10 +80,9 @@ def rolling_metrics(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     pf = gross_win / gross_loss.replace(0, np.nan)
     wr = roll['is_win'].mean()
 
-    # Equity-curve drawdown: cumulative realized PnL, peak-to-trough
-    equity = df_sorted['pnl'].cumsum()
-    rolling_max = equity.expanding().max()
-    dd = (equity - rolling_max) / (rolling_max + 1e-9)
+    # Drawdown from equity curve with starting capital
+    equity = initial_capital + df_sorted['pnl'].cumsum()
+    dd = equity / equity.cummax() - 1
 
     return pd.DataFrame({
         'trade_end': df_sorted['exit_time'],
@@ -274,15 +273,16 @@ def filtered_pnl_percents(params: dict, raw: list) -> list:
         if score < params['min_score']:
             continue
         adj = simulate_trade_exit(r, params)
-        selected.append({'pnl_pct': adj, 'pnl': r.get('pnl', 0)})
+        sim_pnl = adj * r['notional']
+        selected.append({'pnl_pct': adj, 'sim_pnl': sim_pnl, 'notional': r['notional']})
     return selected
 
 
 def pf_from_pnl_list(trades: list) -> float:
     if len(trades) < 3:
         return 0
-    gross_win = sum(abs(t['pnl']) for t in trades if t['pnl_pct'] > 0)
-    gross_loss = sum(abs(t['pnl']) for t in trades if t['pnl_pct'] <= 0)
+    gross_win = sum(abs(t['sim_pnl']) for t in trades if t['pnl_pct'] > 0)
+    gross_loss = sum(abs(t['sim_pnl']) for t in trades if t['pnl_pct'] <= 0)
     if gross_loss < 1e-9:
         return 999 if gross_win > 0 else 0
     return gross_win / gross_loss
@@ -304,8 +304,7 @@ def compute_pf_full(params: dict, raw: list) -> float:
 def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     """
     Optimize weights + filters + exits to maximize PF.
-    Uses walk-forward: trains on first 60% of chronologically-sorted trades,
-    evaluates on last 40%. Returns both in-sample and out-of-sample PF.
+    Multi-fold walk-forward: expanding window (4 folds) for robust OOS estimate.
     """
     try:
         import optuna
@@ -313,26 +312,47 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         return None
 
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
-    split = int(len(df_sorted) * 0.6)
-    if split < 10 or len(df_sorted) - split < 5:
-        split = max(len(df_sorted) - 5, 5)
-
-    train_raw = _df_to_raw(df_sorted.iloc[:split])
-    test_raw = _df_to_raw(df_sorted.iloc[split:])
-
-    if len(train_raw) < 5:
+    n = len(df_sorted)
+    if n < 20:
         return None
+
+    folds = [0.40, 0.55, 0.70, 0.85]
+    fold_splits = []
+    for f in folds:
+        train_end = int(n * f)
+        test_end = int(n * min(f + 0.15, 1.0))
+        if train_end >= test_end or train_end < 5 or test_end - train_end < 3:
+            continue
+        fold_splits.append((train_end, test_end))
+
+    if not fold_splits:
+        train_end, test_end = int(n * 0.6), n
+        fold_splits = [(train_end, test_end)]
+
+    train_raw_all = _df_to_raw(df_sorted)
+
+    def compute_pf_for_split(params: dict, train_end: int, test_end: int) -> tuple:
+        train_raw = train_raw_all[:train_end]
+        test_raw = train_raw_all[train_end:test_end]
+        return compute_pf_full(params, train_raw), compute_pf_full(params, test_raw)
 
     def objective(trial):
         params = _suggest_params(trial)
-        return compute_pf_full(params, train_raw)
+        pfs = [compute_pf_for_split(params, te, tte)[0] for te, tte in fold_splits]
+        return sum(pfs) / len(pfs)
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     best = study.best_params
-    train_pf = study.best_value
-    test_pf = compute_pf_full(best, test_raw)
+    train_pfs = []
+    test_pfs = []
+    for te, tte in fold_splits:
+        tr, tev = compute_pf_for_split(best, te, tte)
+        train_pfs.append(tr)
+        test_pfs.append(tev)
+    train_pf = sum(train_pfs) / len(train_pfs)
+    test_pf = sum(test_pfs) / len(test_pfs)
 
     tw = best['w_wallet'] + best['w_age'] + best['w_liq']
     best_norm = {
@@ -346,8 +366,9 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         'best_weights_norm': best_norm,
         'train_pf': train_pf,
         'test_pf': test_pf,
-        'n_train': len(train_raw),
-        'n_test': len(test_raw),
+        'n_folds': len(fold_splits),
+        'n_train': sum(te for te, _ in fold_splits) // len(fold_splits),
+        'n_test': sum(tte - te for te, tte in fold_splits) // len(fold_splits),
         'trials': n_trials,
         'study': study,
         'n_params': len(best),
@@ -358,16 +379,18 @@ def _df_to_raw(df_slice):
     """Convert a DataFrame slice to the raw list format."""
     raw = []
     for _, row in df_slice.iterrows():
+        entry_px = row.get('entry_price', 1) or 1
+        qty = row.get('quantity', 1) or 1
         raw.append({
             'wallet': row.get('feat_wallets', 0),
             'liq': row.get('feat_liquidity', 0),
             'buy_r': row.get('feat_buyRatio', 0.5),
             'age_ms': row.get('signal_age_ms', 0),
-            'pnl': row['pnl'],
             'pnl_pct_actual': row['pnl_percent'],
             'mfe': row['mfe'] if 'mfe' in row and not pd.isna(row['mfe']) else 0,
-            'max_price': row.get('max_price', 0),
-            'entry_price': row.get('entry_price', 1),
+            'entry_price': entry_px,
+            'quantity': qty,
+            'notional': entry_px * qty,
         })
     return raw
 
@@ -462,7 +485,9 @@ def print_report(result: dict):
         print(f"  PF went from {r['rolling_pf'].iloc[0]:.2f} -> {r['rolling_pf'].iloc[-1]:.2f}")
         print(f"  WR went from {r['rolling_wr'].iloc[0]:.1%} -> {r['rolling_wr'].iloc[-1]:.1%}")
         max_dd = r['drawdown'].min()
-        print(f"  Max drawdown: {max_dd:.1%}")
+        print(f"  Max drawdown from equity peak: {max_dd:.1%}")
+        final_equity = r['equity'].iloc[-1]
+        print(f"  Final equity: ${final_equity:.2f}")
 
     if result.get('xgb'):
         x = result['xgb']

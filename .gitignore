@@ -45,3 +45,4 @@ documents/
 
 # bash files
 *.sh
+scripts/analysis/__pycache__
