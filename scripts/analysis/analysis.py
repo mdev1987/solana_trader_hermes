@@ -139,7 +139,6 @@ def bucket_analysis(df: pd.DataFrame) -> dict:
 def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame | None:
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import cross_val_score
 
     avail = avail_features(df)
     avail = [c for c in avail if c in df.columns and df[c].notna().sum() > 5]
@@ -150,7 +149,7 @@ def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame
     y = df[target].values
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
-    model = LogisticRegression(max_iter=1000, random_state=42)
+    model = LogisticRegression(penalty='l1', solver='saga', max_iter=2000, random_state=42)
     model.fit(Xs, y)
     return pd.DataFrame({
         'feature': avail, 'coef': model.coef_[0], 'abs_coef': abs(model.coef_[0]),
@@ -159,8 +158,7 @@ def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame
 
 # ── XGBoost PnL Regressor ────────────────────────────────────────────────────
 
-def xgboost_regression(df: pd.DataFrame) -> dict | None:
-    from sklearn.model_selection import TimeSeriesSplit
+def xgboost_regression(df: pd.DataFrame, n_folds: int = 4) -> dict | None:
     from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
     import xgboost as xgb
 
@@ -171,11 +169,109 @@ def xgboost_regression(df: pd.DataFrame) -> dict | None:
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
     y = df_sorted['pnl'].values
+    n = len(df_sorted)
+    if n < 15:
+        return None
 
+    fold_ends = [int(n * f) for f in [0.40, 0.55, 0.70, 0.85]]
+    folds = []
+    for fe in fold_ends:
+        te = int(n * min(fe / 0.85 + 0.15, 1.0))
+        if fe >= te or fe < 5 or te - fe < 3:
+            continue
+        folds.append((fe, te))
+    if not folds:
+        folds = [(int(n * 0.6), n)]
+
+    _xgb = lambda: xgb.XGBRegressor(
+        n_estimators=100, max_depth=3, learning_rate=0.1,
+        random_state=42, objective='reg:squarederror',
+    )
+
+    y_test_all, y_pred_all = [], []
+    cv_maes = []
+    for fe, te in folds:
+        X_tr, X_te = X[:fe], X[fe:te]
+        y_tr, y_te = y[:fe], y[fe:te]
+        m = _xgb()
+        m.fit(X_tr, y_tr, verbose=False)
+        y_p = m.predict(X_te)
+        y_test_all.extend(y_te)
+        y_pred_all.extend(y_p)
+        cv_maes.append(mean_absolute_error(y_te, y_p))
+
+    y_test_a = np.array(y_test_all)
+    y_pred_a = np.array(y_pred_all)
+
+    dir_acc = (np.sign(y_pred_a) == np.sign(y_test_a)).mean() if len(y_test_a) else 0
+
+    return {
+        'r2': r2_score(y_test_a, y_pred_a),
+        'mae': mean_absolute_error(y_test_a, y_pred_a),
+        'rmse': np.sqrt(mean_squared_error(y_test_a, y_pred_a)),
+        'direction_accuracy': dir_acc,
+        'cv_mae_mean': np.mean(cv_maes) if cv_maes else 0,
+        'cv_mae_std': np.std(cv_maes) if cv_maes else 0,
+        'fold_details': [(fe, te, te - fe) for (fe, te) in folds],
+    }
+
+
+# ── SHAP Explanation ─────────────────────────────────────────────────────────
+
+def shap_analysis(df: pd.DataFrame) -> dict | None:
+    try:
+        import shap
+        import xgboost as xgb
+    except ImportError:
+        return None
+
+    avail = avail_features(df)
+    if len(avail) < 2:
+        return None
+
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    X = df_sorted[avail].fillna(0).values
+    y = df_sorted['pnl'].values
     split = int(len(df_sorted) * 0.7)
     if split < 5 or len(df_sorted) - split < 3:
         split = max(len(df_sorted) - 3, 3)
+    X_train, X_test = X[:split], X[split:]
 
+    model = xgb.XGBRegressor(
+        n_estimators=100, max_depth=3, learning_rate=0.1,
+        random_state=42, objective='reg:squarederror',
+    )
+    model.fit(X_train, y[:split], verbose=False)
+
+    explainer = shap.Explainer(model, X_train)
+    shap_values = explainer(X_test)
+    mean_shap = np.abs(shap_values.values).mean(axis=0)
+    return {
+        'feature_importance': pd.DataFrame({
+            'feature': avail, 'mean_shap': mean_shap,
+        }).sort_values('mean_shap', ascending=False),
+    }
+
+
+# ── Permutation Importance ────────────────────────────────────────────────────
+
+def permutation_importance(df: pd.DataFrame, n_repeats: int = 30) -> pd.DataFrame | None:
+    try:
+        import xgboost as xgb
+    except ImportError:
+        return None
+    from sklearn.inspection import permutation_importance as sk_perm
+
+    avail = avail_features(df)
+    if len(avail) < 2:
+        return None
+
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    X = df_sorted[avail].fillna(0).values
+    y = df_sorted['pnl'].values
+    split = int(len(df_sorted) * 0.7)
+    if split < 5 or len(df_sorted) - split < 3:
+        split = max(len(df_sorted) - 3, 3)
     X_train, X_test = X[:split], X[split:]
     y_train, y_test = y[:split], y[split:]
 
@@ -183,94 +279,61 @@ def xgboost_regression(df: pd.DataFrame) -> dict | None:
         n_estimators=100, max_depth=3, learning_rate=0.1,
         random_state=42, objective='reg:squarederror',
     )
-    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    model.fit(X_train, y_train, verbose=False)
 
-    y_pred = model.predict(X_test)
-
-    tscv = TimeSeriesSplit(n_splits=min(3, len(df_sorted) // 5))
-    cv_scores = []
-    for train_idx, val_idx in tscv.split(X):
-        m = xgb.XGBRegressor(
-            n_estimators=100, max_depth=3, learning_rate=0.1,
-            random_state=42, objective='reg:squarederror',
-        )
-        m.fit(X[train_idx], y[train_idx], verbose=False)
-        y_cv = m.predict(X[val_idx])
-        cv_scores.append(-mean_absolute_error(y[val_idx], y_cv))
-
-    dir_acc = (np.sign(y_pred) == np.sign(y_test)).mean()
-
-    imp = pd.DataFrame({
+    r = sk_perm(model, X_test, y_test, n_repeats=n_repeats, random_state=42, n_jobs=-1)
+    return pd.DataFrame({
         'feature': avail,
-        'importance': model.feature_importances_,
-    }).sort_values('importance', ascending=False)
-
-    return {
-        'model': model, 'feature_names': avail,
-        'r2': r2_score(y_test, y_pred),
-        'mae': mean_absolute_error(y_test, y_pred),
-        'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
-        'direction_accuracy': dir_acc,
-        'cv_mae_mean': -np.mean(cv_scores) if cv_scores else 0,
-        'cv_mae_std': np.std(cv_scores) if cv_scores else 0,
-        'feature_importance': imp,
-        'X_train': X_train, 'X_test': X_test,
-        'y_train': y_train, 'y_test': y_test,
-        'y_pred': y_pred,
-    }
+        'importance_mean': r.importances_mean,
+        'importance_std': r.importances_std,
+    }).sort_values('importance_mean', ascending=False)
 
 
-# ── SHAP Explanation ─────────────────────────────────────────────────────────
+# ── Bootstrap Confidence Intervals ────────────────────────────────────────────
 
-def shap_analysis(model_result: dict) -> dict | None:
-    try:
-        import shap
-    except ImportError:
-        return None
-    model = model_result['model']
-    X_train = model_result['X_train']
-    X_test = model_result['X_test']
-    names = model_result['feature_names']
-    explainer = shap.Explainer(model, X_train)
-    shap_values = explainer(X_test)
-    mean_shap = np.abs(shap_values.values).mean(axis=0)
-    return {
-        'explainer': explainer, 'shap_values': shap_values,
-        'feature_importance': pd.DataFrame({
-            'feature': names, 'mean_shap': mean_shap,
-        }).sort_values('mean_shap', ascending=False),
-    }
+def bootstrap_ci(df: pd.DataFrame, n_bootstrap: int = 5000) -> dict:
+    np.random.seed(42)
+    n = len(df)
+    pnls = df['pnl'].values
+    is_win = df['is_win'].values
 
+    stats = {'pf': [], 'wr': [], 'expectancy': [], 'sharpe': []}
+    for _ in range(n_bootstrap):
+        idx = np.random.randint(0, n, n)
+        sample = pnls[idx]
+        sw = is_win[idx]
+        gw = sample[sample > 0].sum()
+        gl = abs(sample[sample <= 0].sum())
+        pf = gw / gl if gl > 1e-9 else (999 if gw > 0 else 0)
+        wr = sw.mean()
+        exp = sample.mean()
+        sharpe = sample.mean() / sample.std() * np.sqrt(365) if sample.std() > 1e-9 else 0
+        stats['pf'].append(pf)
+        stats['wr'].append(wr)
+        stats['expectancy'].append(exp)
+        stats['sharpe'].append(sharpe)
 
-# ── Optuna Full-Parameter Optimization with Walk-Forward ─────────────────────
+    result = {}
+    for k, v in stats.items():
+        arr = np.array(v)
+        result[k] = {
+            'mean': arr.mean(),
+            'median': np.median(arr),
+            'ci_95': (np.percentile(arr, 2.5), np.percentile(arr, 97.5)),
+        }
+    return result
 
 def simulate_trade_exit(row: dict, params: dict) -> float:
     """
-    Simulate exit for a single trade given params.
-    Order matches live engine: SL (floor) → break-even (floor) → trailing (floor) → TP (ceiling).
+    Simulate exit from pnl_percent + SL/TP caps only.
+    Break-even and trailing stop require tick-level price paths
+    (MFE is look-ahead bias) — they must be optimized via full replay.
     """
     pnl = row['pnl_pct_actual']
-    mfe = row['mfe']
-
     sl = abs(params['stop_loss'])
     tp = params['take_profit']
-    be = params['break_even']
-    trail_act = params.get('trail_activate', 0.25)
-    trail_dist = params.get('trail_distance', 0.12)
 
-    # hard stop first
     pnl = max(pnl, -sl)
-
-    # break-even: if price reached activate%, floor at 0
-    if mfe >= be:
-        pnl = max(pnl, 0.0)
-
-    # trailing: if price reached trail_activate%, floor at trail exit price
-    if mfe >= trail_act:
-        trail_exit = (1 + mfe) * (1 - trail_dist) - 1
-        pnl = max(pnl, trail_exit)
-
-    # TP cap last — trailing cannot beat this
     pnl = min(pnl, tp)
     return pnl
 
@@ -352,8 +415,12 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
     def objective(trial):
         params = _suggest_params(trial)
-        pfs = [compute_pf_for_split(params, te, tte)[0] for te, tte in fold_splits]
-        return sum(pfs) / len(pfs)
+        pfs = [compute_pf_for_split(params, te, tte) for te, tte in fold_splits]
+        train_pfs = [p[0] for p in pfs]
+        test_pfs = [p[1] for p in pfs]
+        avg_train = sum(train_pfs) / len(train_pfs)
+        avg_test = sum(test_pfs) / len(test_pfs)
+        return avg_test - 0.3 * abs(avg_train - avg_test)
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
@@ -424,9 +491,6 @@ def _suggest_params(trial):
         'min_age': trial.suggest_int('min_age', 0, 20000, step=2000),
         'stop_loss': trial.suggest_float('stop_loss', -0.50, -0.10, step=0.05),
         'take_profit': trial.suggest_float('take_profit', 0.20, 1.0, step=0.10),
-        'break_even': trial.suggest_float('break_even', 0.05, 0.30, step=0.05),
-        'trail_activate': trial.suggest_float('trail_activate', 0.10, 0.40, step=0.05),
-        'trail_distance': trial.suggest_float('trail_distance', 0.05, 0.25, step=0.05),
     }
 
 
@@ -471,11 +535,18 @@ def run_analysis(trades_csv: str | Path, rejected_csv: str | Path | None = None)
             print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  DirAcc={x['direction_accuracy']:.1%}")
             print(f"  CV MAE={x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
 
+            print("Permutation importance...")
+            result['permutation_imp'] = permutation_importance(df)
+
             print("SHAP analysis...")
-            result['shap'] = shap_analysis(x)
+            result['shap'] = shap_analysis(df)
             if result.get('shap'):
                 top = result['shap']['feature_importance'].head(5)
                 print(f"  Top features:\n{top.to_string(index=False)}")
+
+    # Bootstrap CIs
+    print("Bootstrap confidence intervals...")
+    result['bootstrap'] = bootstrap_ci(df)
 
     return result
 
@@ -509,20 +580,29 @@ def print_report(result: dict):
 
     if result.get('xgb'):
         x = result['xgb']
-        print(f"\nXGBoost PnL Regressor:")
+        print(f"\nXGBoost PnL Regressor (expanding walk-forward):")
         print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  RMSE=${x['rmse']:.4f}")
         print(f"  Direction accuracy: {x['direction_accuracy']:.1%}")
         print(f"  CV MAE: {x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
-        print(f"\nFeature Importance:")
-        print(x['feature_importance'].to_string(index=False))
+
+    if result.get('permutation_imp') is not None:
+        print(f"\nPermutation Importance (XGBoost):")
+        print(result['permutation_imp'].to_string(index=False))
 
     if result.get('shap'):
         print(f"\nSHAP Feature Importance (mean |SHAP|):")
         print(result['shap']['feature_importance'].to_string(index=False))
 
     if result.get('feature_importance_lr') is not None:
-        print(f"\nLogistic Regression Coefficients:")
+        print(f"\nLogistic Regression Coefficients (L1 penalty):")
         print(result['feature_importance_lr'].to_string(index=False))
+
+    if result.get('bootstrap'):
+        b = result['bootstrap']
+        print(f"\nBootstrap 95% CI (n={5000}):")
+        for k, v in b.items():
+            lo, hi = v['ci_95']
+            print(f"  {k}: {v['mean']:.4f} [{lo:.4f}, {hi:.4f}]")
 
 
 if __name__ == '__main__':
