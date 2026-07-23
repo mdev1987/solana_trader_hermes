@@ -38,7 +38,7 @@ def load_trades_from_csv(csv_path: str | Path) -> pd.DataFrame:
     df['mae'] = (df['entry_price'] - df['min_price']) / df['entry_price']
     df['hold_sec'] = (df['exit_time'] - df['entry_time']) / 1000
 
-    # ── Engineered features (rate-based, interaction) ──
+    # ── Engineered features ──
     df['r_signal_age_s'] = df['signal_age_ms'] / 1000
     df['wallet_density'] = df['feat_wallets'] / (df['r_signal_age_s'] + 1)
     df['liq_per_wallet'] = df['feat_liquidity'] / (df['feat_wallets'] + 1)
@@ -46,6 +46,21 @@ def load_trades_from_csv(csv_path: str | Path) -> pd.DataFrame:
     df['activity_accel'] = df['feat_activity'] / (df['r_signal_age_s'] / 60 + 1)
     df['score_x_wallets'] = df['entry_score'] * df['feat_wallets'] / 100
     df['wallets_signal_interact'] = df['feat_wallets'] * df['r_signal_age_s'] / 1000
+
+    # Velocity features from engine.py FeatureSnapshot
+    df['feat_fresh_wallet_ratio'] = pd.to_numeric(df.get('feat_fresh_wallet_ratio', 0), errors='coerce')
+    df['feat_wallet_growth_10s'] = pd.to_numeric(df.get('feat_wallet_growth_10s', 0), errors='coerce')
+    df['feat_wallet_growth_30s'] = pd.to_numeric(df.get('feat_wallet_growth_30s', 0), errors='coerce')
+    df['feat_wallet_growth_60s'] = pd.to_numeric(df.get('feat_wallet_growth_60s', 0), errors='coerce')
+    df['feat_volume_last_10s'] = pd.to_numeric(df.get('feat_volume_last_10s', 0), errors='coerce')
+    df['feat_volume_last_30s'] = pd.to_numeric(df.get('feat_volume_last_30s', 0), errors='coerce')
+    df['feat_buy_velocity_10s'] = pd.to_numeric(df.get('feat_buy_velocity_10s', 0), errors='coerce')
+
+    # Ratio features from velocities
+    df['wallet_growth_rate'] = df['feat_wallet_growth_10s'] / (df['r_signal_age_s'] + 1)
+    df['volume_velocity'] = df['feat_volume_last_10s'] / (df['r_signal_age_s'] + 1)
+    df['buy_surge'] = df['feat_buy_velocity_10s'] / (df['feat_wallet_growth_10s'] + 1)
+    df['fresh_wallet_ratio_sq'] = df['feat_fresh_wallet_ratio'] ** 2
     return df
 
 
@@ -63,7 +78,28 @@ def avail_features(df: pd.DataFrame) -> list:
     cols = ['entry_score', 'signal_age_ms', 'entry_delay_ms',
             'feat_wallets', 'feat_liquidity', 'feat_buyRatio', 'feat_activity',
             'wallet_density', 'liq_per_wallet', 'buy_velocity',
-            'activity_accel', 'score_x_wallets', 'wallets_signal_interact']
+            'activity_accel', 'score_x_wallets', 'wallets_signal_interact',
+            'feat_fresh_wallet_ratio', 'feat_wallet_growth_10s',
+            'feat_wallet_growth_30s', 'feat_wallet_growth_60s',
+            'feat_volume_last_10s', 'feat_volume_last_30s',
+            'feat_buy_velocity_10s',
+            'wallet_growth_rate', 'volume_velocity', 'buy_surge',
+            'fresh_wallet_ratio_sq']
+    return [c for c in cols if c in df.columns and df[c].notna().sum() > 5]
+
+
+def pre_trade_features(df: pd.DataFrame) -> list:
+    """Features available BEFORE trade entry (no lookahead)."""
+    cols = ['entry_score', 'signal_age_ms',
+            'feat_wallets', 'feat_liquidity', 'feat_buyRatio', 'feat_activity',
+            'feat_fresh_wallet_ratio', 'feat_wallet_growth_10s',
+            'feat_wallet_growth_30s', 'feat_wallet_growth_60s',
+            'feat_volume_last_10s', 'feat_volume_last_30s',
+            'feat_buy_velocity_10s',
+            'wallet_density', 'liq_per_wallet', 'buy_velocity',
+            'activity_accel', 'score_x_wallets', 'wallets_signal_interact',
+            'wallet_growth_rate', 'volume_velocity', 'buy_surge',
+            'fresh_wallet_ratio_sq']
     return [c for c in cols if c in df.columns and df[c].notna().sum() > 5]
 
 
@@ -164,9 +200,9 @@ def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    avail = avail_features(df)
-    avail = [c for c in avail if c in df.columns and df[c].notna().sum() > 5]
+    avail = pre_trade_features(df)
     if len(avail) < 2 or target not in df.columns:
+        return None
         return None
 
     X = df[avail].fillna(0).values
@@ -180,74 +216,202 @@ def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame
     }).sort_values('abs_coef', ascending=False)
 
 
-# ── XGBoost PnL Regressor ────────────────────────────────────────────────────
+# ── XGBoost Classifier (P(win)) ──────────────────────────────────────────────
 
-def xgboost_regression(df: pd.DataFrame, n_folds: int = 4) -> dict | None:
-    from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+def xgb_classifier(df: pd.DataFrame, target: str = 'is_win') -> dict | None:
+    """
+    Train XGBoost classifier on trades; predicts P(win).
+    Expanding walk-forward evaluation across folds.
+    """
+    from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score
     import xgboost as xgb
 
-    avail = avail_features(df)
-    if len(avail) < 2:
+    avail = pre_trade_features(df)
+    if len(avail) < 2 or target not in df.columns:
         return None
 
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
-    y = df_sorted['pnl'].values
+    y = df_sorted[target].values
     n = len(df_sorted)
     if n < 15:
         return None
 
     folds, _, _ = _walk_forward_folds(n)
+    n_pos = y.sum()
+    scale_pos = (len(y) - n_pos) / n_pos if n_pos > 0 else 1
 
-    _xgb = lambda: xgb.XGBRegressor(
+    _clf = lambda: xgb.XGBClassifier(
         n_estimators=100, max_depth=3, learning_rate=0.1,
-        random_state=42, objective='reg:squarederror',
+        random_state=42, scale_pos_weight=scale_pos,
+        eval_metric='logloss',
     )
 
-    y_test_all, y_pred_all = [], []
-    cv_maes = []
+    y_test_all, y_prob_all, y_pred_all = [], [], []
+    fold_metrics = []
     for fe, te in folds:
         X_tr, X_te = X[:fe], X[fe:te]
         y_tr, y_te = y[:fe], y[fe:te]
-        m = _xgb()
+        m = _clf()
         m.fit(X_tr, y_tr, verbose=False)
-        y_p = m.predict(X_te)
+        y_prob = m.predict_proba(X_te)[:, 1]
+        y_pred = (y_prob >= 0.5).astype(int)
         y_test_all.extend(y_te)
-        y_pred_all.extend(y_p)
-        cv_maes.append(mean_absolute_error(y_te, y_p))
+        y_prob_all.extend(y_prob)
+        y_pred_all.extend(y_pred)
+        fold_metrics.append({
+            'accuracy': accuracy_score(y_te, y_pred),
+            'auc': roc_auc_score(y_te, y_prob) if len(np.unique(y_te)) > 1 else 0,
+            'precision': precision_score(y_te, y_pred, zero_division=0),
+            'recall': recall_score(y_te, y_pred, zero_division=0),
+            'n_test': len(y_te),
+        })
 
     y_test_a = np.array(y_test_all)
+    y_prob_a = np.array(y_prob_all)
     y_pred_a = np.array(y_pred_all)
 
-    dir_acc = (np.sign(y_pred_a) == np.sign(y_test_a)).mean() if len(y_test_a) else 0
+    avg_win = df[df['is_win'] == 1]['pnl'].mean() if y_test_a.sum() > 0 else 0
+    avg_loss = abs(df[df['is_win'] == 0]['pnl'].mean()) if (1 - y_test_a).sum() > 0 else 0
+    ev_per_trade = y_prob_a * avg_win - (1 - y_prob_a) * avg_loss
 
     return {
-        'r2': r2_score(y_test_a, y_pred_a),
-        'mae': mean_absolute_error(y_test_a, y_pred_a),
-        'rmse': np.sqrt(mean_squared_error(y_test_a, y_pred_a)),
-        'direction_accuracy': dir_acc,
-        'cv_mae_mean': np.mean(cv_maes) if cv_maes else 0,
-        'cv_mae_std': np.std(cv_maes) if cv_maes else 0,
-        'fold_details': [(fe, te, te - fe) for (fe, te) in folds],
+        'accuracy': accuracy_score(y_test_a, y_pred_a),
+        'auc': roc_auc_score(y_test_a, y_prob_a) if len(np.unique(y_test_a)) > 1 else 0,
+        'precision': precision_score(y_test_a, y_pred_a, zero_division=0),
+        'recall': recall_score(y_test_a, y_pred_a, zero_division=0),
+        'avg_win_usd': avg_win,
+        'avg_loss_usd': avg_loss,
+        'ev_mean': ev_per_trade.mean(),
+        'ev_median': np.median(ev_per_trade),
+        'fold_details': fold_metrics,
+        'n_test': len(y_test_a),
     }
 
 
-# ── SHAP Explanation (uses same walk-forward scheme: train on 85%, explain on final 15%) ──
+# ── Combined Classifier (trades=1 + rejected=0) ────────────────────────────
 
-def shap_analysis(df: pd.DataFrame) -> dict | None:
+def load_data_for_classifier(trades_csv: str | Path, rejected_csv: str | Path) -> dict | None:
+    """Load trades (class 1) and rejected signals (class 0), align on pre-trade features."""
+    trades = load_trades_from_csv(trades_csv)
+    rejected = load_rejected_from_csv(rejected_csv)
+    if len(trades) < 3 or len(rejected) < 3:
+        return None
+
+    # Build two DataFrames with a shared feature set
+    trades['label'] = 1
+    rejected['label'] = 0
+
+    shared_cols = [c for c in ['entry_score', 'signal_age_ms',
+                                'wallet_count', 'liquidity', 'buy_ratio',
+                                'activity_score', 'fresh_wallet_ratio',
+                                'wallet_growth_10s', 'wallet_growth_30s',
+                                'wallet_growth_60s', 'volume_last_10s',
+                                'volume_last_30s', 'buy_velocity_10s']
+                   if c in trades.columns or c in rejected.columns]
+
+    # Rename rejected fields to match trade feature names
+    rename_map = {
+        'wallet_count': 'feat_wallets',
+        'liquidity': 'feat_liquidity',
+        'buy_ratio': 'feat_buyRatio',
+        'activity_score': 'feat_activity',
+        'signal_age_ms': 'signal_age_ms',
+    }
+    # Build combined rows
+    rows = []
+    for _, r in trades.iterrows():
+        row = {'label': 1, 'timestamp': r.get('entry_time', 0)}
+        for c in shared_cols:
+            row[c] = r.get(rename_map.get(c, f'feat_{c}'), r.get(c, 0))
+        rows.append(row)
+    for _, r in rejected.iterrows():
+        row = {'label': 0, 'timestamp': r.get('timestamp', 0)}
+        for c in shared_cols:
+            if c in rename_map:
+                row[c] = r.get(c, 0)
+            elif c in ('wallet_growth_10s', 'wallet_growth_30s',
+                       'wallet_growth_60s', 'volume_last_10s',
+                       'volume_last_30s', 'buy_velocity_10s',
+                       'fresh_wallet_ratio'):
+                row[c] = r.get(c, 0)
+            else:
+                row[c] = r.get(c, 0)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    feat_cols = [c for c in shared_cols if c in df.columns and df[c].notna().sum() > 5]
+    if len(feat_cols) < 2:
+        return None
+
+    df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+    return {'df': df_sorted, 'features': feat_cols}
+
+
+def fit_combined_classifier(data: dict) -> dict | None:
+    """Train XGBoost classifier on trades (1) vs rejected (0) with walk-forward CV."""
+    import xgboost as xgb
+    from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score
+
+    df = data['df']
+    feat = data['features']
+    X = df[feat].fillna(0).values
+    y = df['label'].values
+    n = len(df)
+    if n < 15:
+        return None
+
+    folds, last_train, _ = _walk_forward_folds(n)
+    n_pos = y.sum()
+    scale_pos = (n - n_pos) / n_pos if n_pos > 0 else 1
+
+    y_test_all, y_prob_all, y_pred_all = [], [], []
+    for fe, te in folds:
+        X_tr, X_te = X[:fe], X[fe:te]
+        y_tr, y_te = y[:fe], y[fe:te]
+        m = xgb.XGBClassifier(
+            n_estimators=100, max_depth=3, learning_rate=0.1,
+            random_state=42, scale_pos_weight=scale_pos,
+            eval_metric='logloss',
+        )
+        m.fit(X_tr, y_tr, verbose=False)
+        y_prob = m.predict_proba(X_te)[:, 1]
+        y_pred = (y_prob >= 0.5).astype(int)
+        y_test_all.extend(y_te)
+        y_prob_all.extend(y_prob)
+        y_pred_all.extend(y_pred)
+
+    y_test_a = np.array(y_test_all)
+    y_prob_a = np.array(y_prob_all)
+    y_pred_a = np.array(y_pred_all)
+
+    return {
+        'accuracy': accuracy_score(y_test_a, y_pred_a),
+        'auc': roc_auc_score(y_test_a, y_prob_a) if len(np.unique(y_test_a)) > 1 else 0,
+        'precision': precision_score(y_test_a, y_pred_a, zero_division=0),
+        'recall': recall_score(y_test_a, y_pred_a, zero_division=0),
+        'n_trades': int(y_test_a.sum()),
+        'n_rejected': int((1 - y_test_a).sum()),
+        'features': feat,
+    }
+
+
+# ── SHAP Explanation (Classifier) ───────────────────────────────────────────
+
+def shap_analysis(df: pd.DataFrame, target: str = 'is_win') -> dict | None:
     try:
         import shap
         import xgboost as xgb
     except ImportError:
         return None
 
-    avail = avail_features(df)
-    if len(avail) < 2:
+    avail = pre_trade_features(df)
+    if len(avail) < 2 or target not in df.columns:
         return None
 
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
-    y = df_sorted['pnl'].values
+    y = df_sorted[target].values
     n = len(df_sorted)
     if n < 10:
         return None
@@ -256,12 +420,17 @@ def shap_analysis(df: pd.DataFrame) -> dict | None:
     if train_end < 5 or test_end - train_end < 3:
         train_end = int(n * 0.7)
     X_train, X_test = X[:train_end], X[train_end:test_end]
+    y_train = y[:train_end]
 
-    model = xgb.XGBRegressor(
+    n_pos = y_train.sum()
+    scale_pos = (len(y_train) - n_pos) / n_pos if n_pos > 0 else 1
+
+    model = xgb.XGBClassifier(
         n_estimators=100, max_depth=3, learning_rate=0.1,
-        random_state=42, objective='reg:squarederror',
+        random_state=42, scale_pos_weight=scale_pos,
+        eval_metric='logloss',
     )
-    model.fit(X_train, y[:train_end], verbose=False)
+    model.fit(X_train, y_train, verbose=False)
 
     explainer = shap.Explainer(model, X_train)
     shap_values = explainer(X_test)
@@ -275,22 +444,22 @@ def shap_analysis(df: pd.DataFrame) -> dict | None:
     }
 
 
-# ── Permutation Importance (same walk-forward scheme: train on 85%, test on final 15%) ──
+# ── Permutation Importance (Classifier) ─────────────────────────────────────
 
-def permutation_importance(df: pd.DataFrame, n_repeats: int = 30) -> pd.DataFrame | None:
+def permutation_importance(df: pd.DataFrame, target: str = 'is_win', n_repeats: int = 30) -> pd.DataFrame | None:
     try:
         import xgboost as xgb
     except ImportError:
         return None
     from sklearn.inspection import permutation_importance as sk_perm
 
-    avail = avail_features(df)
-    if len(avail) < 2:
+    avail = pre_trade_features(df)
+    if len(avail) < 2 or target not in df.columns:
         return None
 
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
-    y = df_sorted['pnl'].values
+    y = df_sorted[target].values
     n = len(df_sorted)
     if n < 10:
         return None
@@ -302,9 +471,13 @@ def permutation_importance(df: pd.DataFrame, n_repeats: int = 30) -> pd.DataFram
     X_train, X_test = X[:train_end], X[train_end:test_end]
     y_train, y_test = y[:train_end], y[train_end:test_end]
 
-    model = xgb.XGBRegressor(
+    n_pos = y_train.sum()
+    scale_pos = (len(y_train) - n_pos) / n_pos if n_pos > 0 else 1
+
+    model = xgb.XGBClassifier(
         n_estimators=100, max_depth=3, learning_rate=0.1,
-        random_state=42, objective='reg:squarederror',
+        random_state=42, scale_pos_weight=scale_pos,
+        eval_metric='logloss',
     )
     model.fit(X_train, y_train, verbose=False)
 
@@ -430,19 +603,35 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
     train_raw_all = _df_to_raw(df_sorted)
 
-    def compute_pf_for_split(params: dict, train_end: int, test_end: int) -> tuple:
+    def compute_pf_for_split(params: dict, train_end: int, test_end: int) -> dict:
         train_raw = train_raw_all[:train_end]
         test_raw = train_raw_all[train_end:test_end]
-        return compute_pf_full(params, train_raw), compute_pf_full(params, test_raw)
+        train_pf = compute_pf_full(params, train_raw)
+        test_selected = filtered_pnl_percents(params, test_raw)
+        test_pf = pf_from_pnl_list(test_selected) if len(test_selected) >= 3 else 0
+        n_test = len(test_selected)
+        wins = sum(1 for t in test_selected if t['pnl_pct'] > 0)
+        wr = wins / n_test if n_test > 0 else 0
+        cumulative = [t['sim_pnl'] for t in test_selected]
+        equity = np.cumsum(cumulative) if cumulative else np.array([0])
+        max_dd = (equity / np.maximum.accumulate(equity) - 1).min() if len(equity) > 0 else 0
+        return {
+            'train_pf': train_pf,
+            'test_pf': test_pf,
+            'n_test': n_test,
+            'wr': wr,
+            'max_dd': max_dd,
+        }
 
     def objective(trial):
         params = _suggest_params(trial)
-        pfs = [compute_pf_for_split(params, te, tte) for te, tte in fold_splits]
-        train_pfs = [p[0] for p in pfs]
-        test_pfs = [p[1] for p in pfs]
-        avg_train = sum(train_pfs) / len(train_pfs)
-        avg_test = sum(test_pfs) / len(test_pfs)
-        return avg_test - 0.3 * abs(avg_train - avg_test)
+        results = [compute_pf_for_split(params, te, tte) for te, tte in fold_splits]
+        avg_test_pf = sum(r['test_pf'] for r in results) / len(results)
+        total_n = sum(r['n_test'] for r in results)
+        avg_wr = sum(r['wr'] for r in results) / len(results)
+        max_dd = min(r['max_dd'] for r in results)
+        score = avg_test_pf * np.sqrt(total_n) * avg_wr - abs(max_dd)
+        return score
 
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
@@ -452,8 +641,8 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     all_test_trades: list[dict] = []
     fold_sizes = []
     for te, tte in fold_splits:
-        tr, _ = compute_pf_for_split(best, te, tte)
-        train_pfs.append(tr)
+        r = compute_pf_for_split(best, te, tte)
+        train_pfs.append(r['train_pf'])
         test_raw = train_raw_all[te:tte]
         selected = filtered_pnl_percents(best, test_raw)
         all_test_trades.extend(selected)
@@ -481,19 +670,6 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         'test_pf': test_pf,
         'holdout_pf': holdout_pf,
         'n_holdout_trades': len(holdout_trades),
-        'n_folds': len(fold_splits),
-        'fold_sizes': [(tr, te, n_raw, n_sel) for tr, te, n_raw, n_sel in fold_sizes],
-        'pooled_test_trades': len(all_test_trades),
-        'trials': n_trials,
-        'study': study,
-        'n_params': len(best),
-    }
-
-    return {
-        'best_params': best,
-        'best_weights_norm': best_norm,
-        'train_pf': train_pf,
-        'test_pf': test_pf,
         'n_folds': len(fold_splits),
         'fold_sizes': [(tr, te, n_raw, n_sel) for tr, te, n_raw, n_sel in fold_sizes],
         'pooled_test_trades': len(all_test_trades),
@@ -565,18 +741,20 @@ def run_analysis(trades_csv: str | Path, rejected_csv: str | Path | None = None)
     result['rolling'] = rolling_metrics(df)
 
     # Feature importance (logistic regression)
-    if len(avail_features(df)) >= 2:
+    if len(pre_trade_features(df)) >= 2:
         print("Feature importance (logistic regression)...")
         result['feature_importance_lr'] = feature_importance(df)
 
-    # XGBoost PnL regression
-    if len(avail_features(df)) >= 2:
-        print("XGBoost PnL regression...")
-        result['xgb'] = xgboost_regression(df)
-        if result.get('xgb'):
-            x = result['xgb']
-            print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  DirAcc={x['direction_accuracy']:.1%}")
-            print(f"  CV MAE={x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
+    # XGBoost classifier (P(win)) → expected value
+    if len(pre_trade_features(df)) >= 2:
+        print("XGBoost classifier (P(win))...")
+        result['classifier'] = xgb_classifier(df)
+        if result.get('classifier'):
+            c = result['classifier']
+            print(f"  Accuracy={c['accuracy']:.1%}  AUC={c['auc']:.3f}  "
+                  f"Prec={c['precision']:.1%}  Recall={c['recall']:.1%}")
+            print(f"  Avg win=${c['avg_win_usd']:.4f}  Avg loss=${c['avg_loss_usd']:.4f}")
+            print(f"  Expected value: mean=${c['ev_mean']:.4f}  median=${c['ev_median']:.4f}")
 
             print("Permutation importance...")
             result['permutation_imp'] = permutation_importance(df)
@@ -586,6 +764,18 @@ def run_analysis(trades_csv: str | Path, rejected_csv: str | Path | None = None)
             if result.get('shap'):
                 top = result['shap']['feature_importance'].head(5)
                 print(f"  Top features:\n{top.to_string(index=False)}")
+
+    # Combined classifier (trades=1 + rejected=0)
+    if rejected_csv:
+        print("Combined classifier (trades vs rejected)...")
+        combined = load_data_for_classifier(trades_csv, rejected_csv)
+        if combined:
+            result['combined_clf'] = fit_combined_classifier(combined)
+            if result.get('combined_clf'):
+                cc = result['combined_clf']
+                print(f"  Accuracy={cc['accuracy']:.1%}  AUC={cc['auc']:.3f}  "
+                      f"Prec={cc['precision']:.1%}  Recall={cc['recall']:.1%}")
+                print(f"  Trades (1): {cc['n_trades']}  Rejected (0): {cc['n_rejected']}")
 
     # Bootstrap CIs
     print("Bootstrap confidence intervals...")
@@ -621,15 +811,28 @@ def print_report(result: dict):
         final_equity = r['equity'].iloc[-1]
         print(f"  Final equity: ${final_equity:.2f}")
 
-    if result.get('xgb'):
-        x = result['xgb']
-        print(f"\nXGBoost PnL Regressor (expanding walk-forward):")
-        print(f"  R²={x['r2']:.3f}  MAE=${x['mae']:.4f}  RMSE=${x['rmse']:.4f}")
-        print(f"  Direction accuracy: {x['direction_accuracy']:.1%}")
-        print(f"  CV MAE: {x['cv_mae_mean']:.4f} ± {x['cv_mae_std']:.4f}")
+    if result.get('classifier'):
+        c = result['classifier']
+        print(f"\nXGBoost Classifier (P(win)) — expanding walk-forward:")
+        print(f"  Accuracy={c['accuracy']:.1%}  AUC={c['auc']:.3f}  "
+              f"Prec={c['precision']:.1%}  Recall={c['recall']:.1%}")
+        print(f"  Avg win=${c['avg_win_usd']:.4f}  Avg loss=${c['avg_loss_usd']:.4f}")
+        print(f"  Expected value: mean=${c['ev_mean']:.4f}  median=${c['ev_median']:.4f}")
+        if c.get('fold_details'):
+            print(f"  Across {len(c['fold_details'])} folds:")
+            avg_acc = np.mean([f['accuracy'] for f in c['fold_details']])
+            avg_auc = np.mean([f['auc'] for f in c['fold_details']])
+            print(f"    Avg accuracy={avg_acc:.1%}  Avg AUC={avg_auc:.3f}")
+
+    if result.get('combined_clf'):
+        cc = result['combined_clf']
+        print(f"\nCombined Classifier (trades[1] vs rejected[0]):")
+        print(f"  Accuracy={cc['accuracy']:.1%}  AUC={cc['auc']:.3f}  "
+              f"Prec={cc['precision']:.1%}  Recall={cc['recall']:.1%}")
+        print(f"  Trades in test: {cc['n_trades']}  Rejected in test: {cc['n_rejected']}")
 
     if result.get('permutation_imp') is not None:
-        print(f"\nPermutation Importance (XGBoost):")
+        print(f"\nPermutation Importance (XGBoost Classifier):")
         print(result['permutation_imp'].to_string(index=False))
 
     if result.get('shap'):
@@ -637,8 +840,13 @@ def print_report(result: dict):
         print(result['shap']['feature_importance'].to_string(index=False))
 
     if result.get('feature_importance_lr') is not None:
-        print(f"\nLogistic Regression Coefficients (L1 penalty):")
-        print(result['feature_importance_lr'].to_string(index=False))
+        print(f"\nLogistic Regression Coefficients (L1 — sparse):")
+        lr = result['feature_importance_lr']
+        nonzero = lr[lr['abs_coef'] > 1e-6]
+        if len(nonzero):
+            print(nonzero.to_string(index=False))
+        else:
+            print("  All features eliminated by L1 penalty")
 
     if result.get('bootstrap'):
         b = result['bootstrap']

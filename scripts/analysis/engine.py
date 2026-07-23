@@ -18,6 +18,13 @@ class FeatureSnapshot:
     smart_wallets: int = 0
     buy_ratio: float = 0
     time_since_launch_ms: int = 0
+    fresh_wallet_ratio: float = 0
+    wallet_growth_10s: float = 0
+    wallet_growth_30s: float = 0
+    wallet_growth_60s: float = 0
+    volume_last_10s: float = 0
+    volume_last_30s: float = 0
+    buy_velocity_10s: float = 0
 
 
 @dataclass
@@ -46,8 +53,9 @@ class TradeResult:
 
 class MintState:
     __slots__ = ('first_seen', 'last_seen', 'event_count', 'buy_count',
-                 'sell_count', 'volume_total', 'wallets',
-                 'highest_quote_amount', 'last_quote_amount', 'last_token_amount')
+                 'sell_count', 'volume_total', 'wallets', 'wallet_first_seen',
+                 'highest_quote_amount', 'last_quote_amount', 'last_token_amount',
+                 'event_times', 'buy_times', 'volume_events')
     def __init__(self):
         self.first_seen: int = 0
         self.last_seen: int = 0
@@ -56,9 +64,13 @@ class MintState:
         self.sell_count: int = 0
         self.volume_total: float = 0
         self.wallets: set[str] = set()
+        self.wallet_first_seen: dict[str, int] = {}
         self.highest_quote_amount: float = 0
         self.last_quote_amount: float = 0
         self.last_token_amount: float = 0
+        self.event_times: list[int] = []
+        self.buy_times: list[int] = []
+        self.volume_events: list[tuple[int, float]] = []
 
 
 class FeatureBuilder:
@@ -88,18 +100,24 @@ class FeatureBuilder:
         s.last_seen = timestamp
         s.event_count += 1
 
+        s.event_times.append(timestamp)
+
         if action == 'buy':
             s.buy_count += 1
+            s.buy_times.append(timestamp)
         elif action == 'sell':
             s.sell_count += 1
 
         tx_signer = event.get('txSigner')
         if tx_signer:
+            if tx_signer not in s.wallets:
+                s.wallet_first_seen[tx_signer] = timestamp
             s.wallets.add(tx_signer)
 
         if action in ('buy', 'sell'):
             qa = event.get('quoteAmount') or 0
             s.volume_total += qa
+            s.volume_events.append((timestamp, qa))
             if qa > s.highest_quote_amount:
                 s.highest_quote_amount = qa
             s.last_quote_amount = qa
@@ -108,9 +126,20 @@ class FeatureBuilder:
         if action == 'create':
             qa = event.get('quoteAmount') or 0
             s.volume_total += qa
+            s.volume_events.append((timestamp, qa))
             s.buy_count += 1
+            s.buy_times.append(timestamp)
             s.last_quote_amount = qa
             s.last_token_amount = event.get('initialBuy') or 0
+
+        # ── Prune stale window data ──
+        cutoff_60s = timestamp - 60_000
+        while s.event_times and s.event_times[0] < cutoff_60s:
+            s.event_times.pop(0)
+        while s.buy_times and s.buy_times[0] < cutoff_60s:
+            s.buy_times.pop(0)
+        while s.volume_events and s.volume_events[0][0] < cutoff_60s:
+            s.volume_events.pop(0)
 
         time_span = max(s.last_seen - s.first_seen, 1)
         events_per_min = s.event_count / (time_span / 60000)
@@ -118,6 +147,21 @@ class FeatureBuilder:
         wallet_count = len(s.wallets)
         buy_ratio = s.buy_count / s.event_count if s.event_count > 0 else 0
         time_since_launch_ms = timestamp - s.first_seen
+
+        # ── Velocity & wallet quality ──
+        def count_since(times, window_ms):
+            return sum(1 for t in times if t >= timestamp - window_ms)
+
+        def volume_since(events, window_ms):
+            return sum(v for t, v in events if t >= timestamp - window_ms)
+
+        w10 = count_since(s.event_times, 10_000)
+        w30 = count_since(s.event_times, 30_000)
+        w60 = count_since(s.event_times, 60_000)
+
+        fresh_threshold = timestamp - 30_000
+        fresh_count = sum(1 for ft in s.wallet_first_seen.values() if ft >= fresh_threshold)
+        fresh_wallet_ratio = fresh_count / wallet_count if wallet_count > 0 else 0
 
         return FeatureSnapshot(
             mint=mint,
@@ -130,6 +174,13 @@ class FeatureBuilder:
             activity_score=activity_score,
             buy_ratio=buy_ratio,
             time_since_launch_ms=time_since_launch_ms,
+            fresh_wallet_ratio=fresh_wallet_ratio,
+            wallet_growth_10s=w10,
+            wallet_growth_30s=w30,
+            wallet_growth_60s=w60,
+            volume_last_10s=volume_since(s.volume_events, 10_000),
+            volume_last_30s=volume_since(s.volume_events, 30_000),
+            buy_velocity_10s=count_since(s.buy_times, 10_000),
         )
 
 

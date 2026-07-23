@@ -55,6 +55,13 @@ def export_to_csv(trades: list, rejected: list, out_dir: str = None) -> dict:
                 'liquidity': s.liquidity,
                 'signal_age_ms': s.time_since_launch_ms,
                 'price': r['price'],
+                'fresh_wallet_ratio': s.fresh_wallet_ratio,
+                'wallet_growth_10s': s.wallet_growth_10s,
+                'wallet_growth_30s': s.wallet_growth_30s,
+                'wallet_growth_60s': s.wallet_growth_60s,
+                'volume_last_10s': s.volume_last_10s,
+                'volume_last_30s': s.volume_last_30s,
+                'buy_velocity_10s': s.buy_velocity_10s,
             })
         df = pd.DataFrame(rows)
         path = out / 'rejected_signals.csv'
