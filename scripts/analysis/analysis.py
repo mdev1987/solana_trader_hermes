@@ -67,6 +67,30 @@ def avail_features(df: pd.DataFrame) -> list:
     return [c for c in cols if c in df.columns and df[c].notna().sum() > 5]
 
 
+# ── Walk-Forward Folds (shared by XGBoost, SHAP, permutation, Optuna) ──────
+
+def _walk_forward_folds(n: int):
+    """
+    Return (fold_splits, train_end, test_end) for expanding walk-forward:
+      fold 0: train 0-40%, test 40-55%
+      fold 1: train 0-55%, test 55-70%
+      fold 2: train 0-70%, test 70-85%
+      fold 3: train 0-85%, test 85-100%  (held out as final evaluation)
+    """
+    fold_ends = [int(n * f) for f in [0.40, 0.55, 0.70, 0.85]]
+    fold_splits = []
+    for fe in fold_ends:
+        te = int(n * min(fe / 0.85 + 0.15, 1.0))
+        if fe >= te or fe < 5 or te - fe < 3:
+            continue
+        fold_splits.append((fe, te))
+    if not fold_splits:
+        fold_splits = [(int(n * 0.6), n)]
+    last_train_end = fold_ends[-1] if fold_splits else int(n * 0.7)
+    last_test_end = n
+    return fold_splits, last_train_end, last_test_end
+
+
 # ── Rolling Metrics ──────────────────────────────────────────────────────────
 
 def rolling_metrics(df: pd.DataFrame, window: int = 20, initial_capital: float = 10.0) -> pd.DataFrame:
@@ -173,15 +197,7 @@ def xgboost_regression(df: pd.DataFrame, n_folds: int = 4) -> dict | None:
     if n < 15:
         return None
 
-    fold_ends = [int(n * f) for f in [0.40, 0.55, 0.70, 0.85]]
-    folds = []
-    for fe in fold_ends:
-        te = int(n * min(fe / 0.85 + 0.15, 1.0))
-        if fe >= te or fe < 5 or te - fe < 3:
-            continue
-        folds.append((fe, te))
-    if not folds:
-        folds = [(int(n * 0.6), n)]
+    folds, _, _ = _walk_forward_folds(n)
 
     _xgb = lambda: xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.1,
@@ -216,7 +232,7 @@ def xgboost_regression(df: pd.DataFrame, n_folds: int = 4) -> dict | None:
     }
 
 
-# ── SHAP Explanation ─────────────────────────────────────────────────────────
+# ── SHAP Explanation (uses same walk-forward scheme: train on 85%, explain on final 15%) ──
 
 def shap_analysis(df: pd.DataFrame) -> dict | None:
     try:
@@ -232,16 +248,20 @@ def shap_analysis(df: pd.DataFrame) -> dict | None:
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
     y = df_sorted['pnl'].values
-    split = int(len(df_sorted) * 0.7)
-    if split < 5 or len(df_sorted) - split < 3:
-        split = max(len(df_sorted) - 3, 3)
-    X_train, X_test = X[:split], X[split:]
+    n = len(df_sorted)
+    if n < 10:
+        return None
+
+    _, train_end, test_end = _walk_forward_folds(n)
+    if train_end < 5 or test_end - train_end < 3:
+        train_end = int(n * 0.7)
+    X_train, X_test = X[:train_end], X[train_end:test_end]
 
     model = xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.1,
         random_state=42, objective='reg:squarederror',
     )
-    model.fit(X_train, y[:split], verbose=False)
+    model.fit(X_train, y[:train_end], verbose=False)
 
     explainer = shap.Explainer(model, X_train)
     shap_values = explainer(X_test)
@@ -250,10 +270,12 @@ def shap_analysis(df: pd.DataFrame) -> dict | None:
         'feature_importance': pd.DataFrame({
             'feature': avail, 'mean_shap': mean_shap,
         }).sort_values('mean_shap', ascending=False),
+        'n_train': train_end,
+        'n_test': test_end - train_end,
     }
 
 
-# ── Permutation Importance ────────────────────────────────────────────────────
+# ── Permutation Importance (same walk-forward scheme: train on 85%, test on final 15%) ──
 
 def permutation_importance(df: pd.DataFrame, n_repeats: int = 30) -> pd.DataFrame | None:
     try:
@@ -269,11 +291,16 @@ def permutation_importance(df: pd.DataFrame, n_repeats: int = 30) -> pd.DataFram
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     X = df_sorted[avail].fillna(0).values
     y = df_sorted['pnl'].values
-    split = int(len(df_sorted) * 0.7)
-    if split < 5 or len(df_sorted) - split < 3:
-        split = max(len(df_sorted) - 3, 3)
-    X_train, X_test = X[:split], X[split:]
-    y_train, y_test = y[:split], y[split:]
+    n = len(df_sorted)
+    if n < 10:
+        return None
+
+    _, train_end, test_end = _walk_forward_folds(n)
+    if train_end < 5 or test_end - train_end < 3:
+        train_end = int(n * 0.7)
+        test_end = n
+    X_train, X_test = X[:train_end], X[train_end:test_end]
+    y_train, y_test = y[:train_end], y[train_end:test_end]
 
     model = xgb.XGBRegressor(
         n_estimators=100, max_depth=3, learning_rate=0.1,
@@ -383,7 +410,7 @@ def compute_pf_full(params: dict, raw: list) -> float:
 def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     """
     Optimize weights + filters + exits to maximize PF.
-    Multi-fold walk-forward: expanding window (4 folds) for robust OOS estimate.
+    Multi-fold walk-forward (folds 0-2 only; fold 3 is final untouched holdout).
     """
     try:
         import optuna
@@ -392,19 +419,14 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
     df_sorted = df.sort_values('exit_time').reset_index(drop=True)
     n = len(df_sorted)
-    if n < 20:
+    if n < 30:
         return None
 
-    fold_ends = [int(n * f) for f in [0.40, 0.55, 0.70, 0.85]]
-    fold_splits = []
-    for fe in fold_ends:
-        te = int(n * min(n / fold_ends[-1] if fe == fold_ends[-1] else (fe / n + 0.15), 1.0))
-        if fe >= te or fe < 5 or te - fe < 3:
-            continue
-        fold_splits.append((fe, te))
-
+    all_folds, holdout_train_end, _ = _walk_forward_folds(n)
+    # Use only the first 3 folds for optimization; reserve the last (85-100%) as true final holdout
+    fold_splits = all_folds[:-1] if len(all_folds) > 1 else all_folds
     if not fold_splits:
-        fold_splits = [(int(n * 0.6), n)]
+        fold_splits = [(int(n * 0.6), int(n * 0.85))]
 
     train_raw_all = _df_to_raw(df_sorted)
 
@@ -427,7 +449,7 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
     best = study.best_params
     train_pfs = []
-    all_test_trades: list[dict] = []  # pooled test trades across folds
+    all_test_trades: list[dict] = []
     fold_sizes = []
     for te, tte in fold_splits:
         tr, _ = compute_pf_for_split(best, te, tte)
@@ -439,11 +461,32 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     train_pf = sum(train_pfs) / len(train_pfs)
     test_pf = pf_from_pnl_list(all_test_trades)
 
+    # ── Final untouched holdout (fold 3: 85-100%) ──
+    holdout_start = holdout_train_end
+    holdout_raw = train_raw_all[holdout_start:]
+    holdout_trades = filtered_pnl_percents(best, holdout_raw)
+    holdout_pf = pf_from_pnl_list(holdout_trades) if len(holdout_trades) >= 3 else None
+
     tw = best['w_wallet'] + best['w_age'] + best['w_liq']
     best_norm = {
         'wallet': best['w_wallet'] / tw,
         'age': best['w_age'] / tw,
         'liq': best['w_liq'] / tw,
+    }
+
+    return {
+        'best_params': best,
+        'best_weights_norm': best_norm,
+        'train_pf': train_pf,
+        'test_pf': test_pf,
+        'holdout_pf': holdout_pf,
+        'n_holdout_trades': len(holdout_trades),
+        'n_folds': len(fold_splits),
+        'fold_sizes': [(tr, te, n_raw, n_sel) for tr, te, n_raw, n_sel in fold_sizes],
+        'pooled_test_trades': len(all_test_trades),
+        'trials': n_trials,
+        'study': study,
+        'n_params': len(best),
     }
 
     return {
@@ -603,6 +646,10 @@ def print_report(result: dict):
         for k, v in b.items():
             lo, hi = v['ci_95']
             print(f"  {k}: {v['mean']:.4f} [{lo:.4f}, {hi:.4f}]")
+
+    if result.get('holdout_pf') is not None:
+        print(f"\nFinal untouched holdout (fold 3, 85-100%):")
+        print(f"  PF={result['holdout_pf']:.2f}  n={result['n_holdout_trades']}")
 
 
 if __name__ == '__main__':
