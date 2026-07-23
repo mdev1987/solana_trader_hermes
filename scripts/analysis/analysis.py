@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import json
-import warnings
-warnings.filterwarnings('ignore')
+
+import config as cfg
 
 
 def parse_features(trade_row) -> dict:
@@ -61,6 +61,9 @@ def load_trades_from_csv(csv_path: str | Path) -> pd.DataFrame:
     df['volume_velocity'] = df['feat_volume_last_10s'] / (df['r_signal_age_s'] + 1)
     df['buy_surge'] = df['feat_buy_velocity_10s'] / (df['feat_wallet_growth_10s'] + 1)
     df['fresh_wallet_ratio_sq'] = df['feat_fresh_wallet_ratio'] ** 2
+
+    # Tick-level price path (JSON [[timestamp, price], ...])
+    df['price_path'] = df.get('price_path', '').fillna('')
     return df
 
 
@@ -197,19 +200,34 @@ def bucket_analysis(df: pd.DataFrame) -> dict:
 # ── Feature Importance (Logistic Regression) ─────────────────────────────────
 
 def feature_importance(df: pd.DataFrame, target: str = 'is_win') -> pd.DataFrame | None:
+    """
+    Logistic regression with L1 penalty, trained on walk-forward train split only
+    to avoid future leakage. Coefficients reflect predictive (not descriptive) signal.
+    """
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
     avail = pre_trade_features(df)
     if len(avail) < 2 or target not in df.columns:
         return None
+
+    df_sorted = df.sort_values('exit_time').reset_index(drop=True)
+    n = len(df_sorted)
+    if n < 10:
         return None
 
-    X = df[avail].fillna(0).values
-    y = df[target].values
+    _, train_end, _ = _walk_forward_folds(n)
+    if train_end < 5:
+        train_end = int(n * 0.7)
+
+    train_df = df_sorted.iloc[:train_end]
+    X = train_df[avail].fillna(0).values
+    y = train_df[target].values
+
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
-    model = LogisticRegression(penalty='l1', solver='saga', max_iter=2000, random_state=42)
+    model = LogisticRegression(penalty='l1', solver='saga', max_iter=2000,
+                               random_state=cfg.SEED, C=0.1)
     model.fit(Xs, y)
     return pd.DataFrame({
         'feature': avail, 'coef': model.coef_[0], 'abs_coef': abs(model.coef_[0]),
@@ -243,7 +261,7 @@ def xgb_classifier(df: pd.DataFrame, target: str = 'is_win') -> dict | None:
 
     _clf = lambda: xgb.XGBClassifier(
         n_estimators=100, max_depth=3, learning_rate=0.1,
-        random_state=42, scale_pos_weight=scale_pos,
+        random_state=cfg.SEED, scale_pos_weight=scale_pos,
         eval_metric='logloss',
     )
 
@@ -371,7 +389,7 @@ def fit_combined_classifier(data: dict) -> dict | None:
         y_tr, y_te = y[:fe], y[fe:te]
         m = xgb.XGBClassifier(
             n_estimators=100, max_depth=3, learning_rate=0.1,
-            random_state=42, scale_pos_weight=scale_pos,
+            random_state=cfg.SEED, scale_pos_weight=scale_pos,
             eval_metric='logloss',
         )
         m.fit(X_tr, y_tr, verbose=False)
@@ -481,7 +499,7 @@ def permutation_importance(df: pd.DataFrame, target: str = 'is_win', n_repeats: 
     )
     model.fit(X_train, y_train, verbose=False)
 
-    r = sk_perm(model, X_test, y_test, n_repeats=n_repeats, random_state=42, n_jobs=-1)
+    r = sk_perm(model, X_test, y_test, n_repeats=n_repeats, random_state=cfg.SEED, n_jobs=-1)
     return pd.DataFrame({
         'feature': avail,
         'importance_mean': r.importances_mean,
@@ -492,7 +510,7 @@ def permutation_importance(df: pd.DataFrame, target: str = 'is_win', n_repeats: 
 # ── Bootstrap Confidence Intervals ────────────────────────────────────────────
 
 def bootstrap_ci(df: pd.DataFrame, n_bootstrap: int = 5000) -> dict:
-    np.random.seed(42)
+    np.random.seed(cfg.SEED)
     n = len(df)
     pnls = df['pnl'].values
     is_win = df['is_win'].values
@@ -523,22 +541,72 @@ def bootstrap_ci(df: pd.DataFrame, n_bootstrap: int = 5000) -> dict:
         }
     return result
 
-def simulate_trade_exit(row: dict, params: dict) -> float:
+def simulate_trade_ticks(price_path: list, entry_price: float, params: dict) -> tuple[float, str]:
     """
-    Simulate exit from pnl_percent + SL/TP caps only.
-    Break-even and trailing stop require tick-level price paths
-    (MFE is look-ahead bias) — they must be optimized via full replay.
+    Replay tick-level price path through exit logic.
+    Returns (pnl_percent, exit_reason).
+    Supports SL, TP, break-even, trailing, dead, TTL — all without MFE look-ahead.
     """
-    pnl = row['pnl_pct_actual']
-    sl = abs(params['stop_loss'])
-    tp = params['take_profit']
+    if not price_path or len(price_path) < 2:
+        return 0, 'no_path'
 
-    pnl = max(pnl, -sl)
-    pnl = min(pnl, tp)
-    return pnl
+    entry_time = price_path[0][0]
+    highest = entry_price
+    stop_loss = entry_price * (1 + params['stop_loss'])
+    take_profit = entry_price * (1 + params['take_profit'])
+    be_activate = entry_price * (1 + params.get('break_even_activate', 0.10))
+    trail_activate_pct = params.get('trail_activate', 0.25)
+    trail_distance = params.get('trail_distance', 0.12)
+    dead_hold_ms = params.get('dead_hold_ms', 240_000)
+    ttl_ms = params.get('ttl_ms', 24 * 3600_000)
+    trailing_activated = False
+
+    for ts, price in price_path[1:]:
+        if price > highest:
+            highest = price
+
+        # Break-even: after +BE% lock in entry
+        if highest >= be_activate and stop_loss < entry_price * 0.999:
+            stop_loss = entry_price * 0.995
+
+        # Stop loss
+        if price <= stop_loss:
+            sim_pnl = (price - entry_price) / entry_price
+            return sim_pnl, 'sl'
+
+        # Take profit
+        if price >= take_profit:
+            sim_pnl = (price - entry_price) / entry_price
+            return sim_pnl, 'tp'
+
+        # TTL
+        if ts - entry_time >= ttl_ms:
+            sim_pnl = (price - entry_price) / entry_price
+            return sim_pnl, 'ttl'
+
+        # Dead hold: never green past deadline
+        hold = ts - entry_time
+        if hold >= dead_hold_ms and highest <= entry_price * 1.001:
+            sim_pnl = (price - entry_price) / entry_price
+            return sim_pnl, 'dead'
+
+        # Trailing stop
+        if not trailing_activated:
+            if highest >= entry_price * (1 + trail_activate_pct):
+                trailing_activated = True
+        if trailing_activated:
+            trail_stop = highest * (1 - trail_distance)
+            if price <= trail_stop:
+                sim_pnl = (price - entry_price) / entry_price
+                return sim_pnl, 'trailing'
+
+    # Never exited — use last tick
+    last_price = price_path[-1][1]
+    sim_pnl = (last_price - entry_price) / entry_price
+    return sim_pnl, 'end_of_data'
 
 
-def filtered_pnl_percents(params: dict, raw: list) -> list:
+def filtered_trades(params: dict, raw: list) -> list:
     selected = []
     for r in raw:
         if r['wallet'] < params['min_wallet']:
@@ -551,9 +619,14 @@ def filtered_pnl_percents(params: dict, raw: list) -> list:
                               params['w_liq'], r['wallet'], r['liq'], r['age_ms'])
         if score < params['min_score']:
             continue
-        adj = simulate_trade_exit(r, params)
-        sim_pnl = adj * r['notional']
-        selected.append({'pnl_pct': adj, 'sim_pnl': sim_pnl, 'notional': r['notional']})
+        if r['price_path']:
+            sim_pnl_pct, reason = simulate_trade_ticks(r['price_path'], r['entry_price'], params)
+        else:
+            sim_pnl_pct = r['pnl_pct_actual']
+            sim_pnl_pct = max(sim_pnl_pct, -abs(params['stop_loss']))
+            sim_pnl_pct = min(sim_pnl_pct, params['take_profit'])
+        sim_pnl = sim_pnl_pct * r['notional']
+        selected.append({'pnl_pct': sim_pnl_pct, 'sim_pnl': sim_pnl, 'notional': r['notional']})
     return selected
 
 
@@ -577,7 +650,7 @@ def compute_score(w_wallet, w_age, w_liq, wallet_count, liq, age_ms):
 
 
 def compute_pf_full(params: dict, raw: list) -> float:
-    return pf_from_pnl_list(filtered_pnl_percents(params, raw))
+    return pf_from_pnl_list(filtered_trades(params, raw))
 
 
 def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
@@ -607,7 +680,7 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         train_raw = train_raw_all[:train_end]
         test_raw = train_raw_all[train_end:test_end]
         train_pf = compute_pf_full(params, train_raw)
-        test_selected = filtered_pnl_percents(params, test_raw)
+        test_selected = filtered_trades(params, test_raw)
         test_pf = pf_from_pnl_list(test_selected) if len(test_selected) >= 3 else 0
         n_test = len(test_selected)
         wins = sum(1 for t in test_selected if t['pnl_pct'] > 0)
@@ -633,7 +706,7 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         score = avg_test_pf * np.sqrt(total_n) * avg_wr - abs(max_dd)
         return score
 
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=cfg.SEED))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     best = study.best_params
@@ -644,7 +717,7 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
         r = compute_pf_for_split(best, te, tte)
         train_pfs.append(r['train_pf'])
         test_raw = train_raw_all[te:tte]
-        selected = filtered_pnl_percents(best, test_raw)
+        selected = filtered_trades(best, test_raw)
         all_test_trades.extend(selected)
         fold_sizes.append((te, tte, len(test_raw), len(selected)))
     train_pf = sum(train_pfs) / len(train_pfs)
@@ -653,7 +726,7 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
     # ── Final untouched holdout (fold 3: 85-100%) ──
     holdout_start = holdout_train_end
     holdout_raw = train_raw_all[holdout_start:]
-    holdout_trades = filtered_pnl_percents(best, holdout_raw)
+    holdout_trades = filtered_trades(best, holdout_raw)
     holdout_pf = pf_from_pnl_list(holdout_trades) if len(holdout_trades) >= 3 else None
 
     tw = best['w_wallet'] + best['w_age'] + best['w_liq']
@@ -680,21 +753,23 @@ def optuna_optimize(df: pd.DataFrame, n_trials: int = 1000) -> dict | None:
 
 
 def _df_to_raw(df_slice):
-    """Convert a DataFrame slice to the raw list format."""
+    """Convert a DataFrame slice to the raw list format with price_path."""
     raw = []
     for _, row in df_slice.iterrows():
         entry_px = row.get('entry_price') or 0
         qty = row.get('quantity') or 0
+        pp = row.get('price_path', '')
+        price_path = json.loads(pp) if isinstance(pp, str) and pp.startswith('[') else []
         raw.append({
             'wallet': row.get('feat_wallets', 0),
             'liq': row.get('feat_liquidity', 0),
             'buy_r': row.get('feat_buyRatio', 0.5),
             'age_ms': row.get('signal_age_ms', 0),
             'pnl_pct_actual': row['pnl_percent'],
-            'mfe': row['mfe'] if 'mfe' in row and not pd.isna(row['mfe']) else 0,
             'entry_price': entry_px,
             'quantity': qty,
             'notional': entry_px * qty,
+            'price_path': price_path,
         })
     return raw
 
@@ -710,6 +785,9 @@ def _suggest_params(trial):
         'min_age': trial.suggest_int('min_age', 0, 20000, step=2000),
         'stop_loss': trial.suggest_float('stop_loss', -0.50, -0.10, step=0.05),
         'take_profit': trial.suggest_float('take_profit', 0.20, 1.0, step=0.10),
+        'break_even_activate': trial.suggest_float('break_even_activate', 0.05, 0.30, step=0.05),
+        'trail_activate': trial.suggest_float('trail_activate', 0.10, 0.40, step=0.05),
+        'trail_distance': trial.suggest_float('trail_distance', 0.05, 0.25, step=0.05),
     }
 
 

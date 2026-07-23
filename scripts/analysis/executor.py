@@ -12,7 +12,8 @@ class OpenPosition:
     __slots__ = ('id', 'mint', 'entry_price', 'quantity', 'entry_time',
                  'highest_price', 'lowest_price', 'entry_delay_ms',
                  'signal_age_ms', 'decision_price', 'entry_score',
-                 'stop_loss', 'take_profit', 'ttl', 'trailing_stop_activated')
+                 'stop_loss', 'take_profit', 'ttl', 'trailing_stop_activated',
+                 'price_history')
     def __init__(self, id: str, mint: str, entry_price: float, quantity: float,
                  entry_time: int, entry_delay_ms: int, signal_age_ms: int,
                  decision_price: float, entry_score: float,
@@ -32,6 +33,7 @@ class OpenPosition:
         self.take_profit = take_profit
         self.ttl = ttl
         self.trailing_stop_activated = False
+        self.price_history: list[tuple[int, float]] = [(entry_time, entry_price)]
 
 
 class PositionManager:
@@ -140,11 +142,13 @@ class PaperExecutor:
             price = prices.get(mint)
             if price is None or price <= 0:
                 continue
+            pos.price_history.append((timestamp, price))
             exit_reason = self._position_manager.check_exit(pos, price, timestamp)
             if exit_reason:
                 self._positions.pop(mint)
                 pnl = (price - pos.entry_price) * pos.quantity
                 pnl_pct = (price - pos.entry_price) / pos.entry_price
+                import json
                 trade = TradeResult(
                     id=pos.id,
                     mint=pos.mint,
@@ -163,6 +167,7 @@ class PaperExecutor:
                     pnl_percent=pnl_pct,
                     exit_reason=exit_reason,
                     fees=0,
+                    price_path=json.dumps(pos.price_history),
                 )
                 self._trades.append(trade)
                 self._recently_sold[mint] = timestamp

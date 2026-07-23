@@ -47,6 +47,7 @@ class TradeResult:
     exit_reason: str
     fees: float
     features: str | None = None
+    price_path: str | None = None
 
 
 # ── Feature Builder ──────────────────────────────────────────────────────────

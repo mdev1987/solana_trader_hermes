@@ -35,6 +35,7 @@ def export_to_csv(trades: list, rejected: list, out_dir: str = None) -> dict:
                 'pnl': t.pnl, 'pnl_percent': t.pnl_percent,
                 'exit_reason': t.exit_reason, 'fees': t.fees,
                 'features': t.features or '',
+                'price_path': t.price_path or '',
             })
         df = pd.DataFrame(rows)
         path = out / 'trades.csv'
